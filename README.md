@@ -1,0 +1,1208 @@
+# trakr
+
+TypeScript state-management library implementing the Unit of Work pattern, with object tracking and undo/redo.
+
+Built on the **TC39 decorator standard** (Stage 3). Requires TypeScript 5+ with `experimentalDecorators` **not** set.
+
+## Installation
+
+```bash
+npm install @katn30/trakr
+```
+
+```json
+// tsconfig.json — no experimentalDecorators needed
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"]
+  }
+}
+```
+
+---
+
+## Quick Start
+
+```typescript
+import {
+  Tracker,
+  TrackedObject,
+  TrackedCollection,
+  Tracked,
+  AutoId,
+} from '@katn30/trakr';
+
+const tracker = new Tracker();
+
+class InvoiceModel extends TrackedObject {
+  @AutoId
+  id: number = 0;
+
+  @Tracked()
+  accessor status: string = '';
+
+  @Tracked((self, value) => value < 0 ? 'Total must be positive' : undefined)
+  accessor total: number = 0;
+
+  readonly lines: TrackedCollection<string>;
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.lines = new TrackedCollection(tracker);
+  }
+}
+
+const invoices = new TrackedCollection<InvoiceModel>(tracker);
+const invoice = tracker.construct(() => new InvoiceModel(tracker));
+invoices.push(invoice);        // state: Insert, idPlaceholder: -1
+
+invoice.status = 'draft';     // recorded
+invoice.total = 100;          // recorded
+invoice.lines.push('item-1'); // recorded
+
+tracker.isDirty;   // true
+tracker.canUndo;   // true
+
+tracker.undo();    // reverts lines.push
+tracker.undo();    // reverts total
+tracker.undo();    // reverts status
+tracker.undo();    // reverts push — state back to Unchanged
+
+tracker.isDirty;   // false
+```
+
+---
+
+## Concepts
+
+### Undo/redo strategy
+
+The two common patterns for implementing undo/redo are:
+
+- **Command** — every change stores a `redoAction` and an `undoAction` closure pair. Undoing calls the inverse function; redoing calls the original. No state is copied.
+- **Memento** — the entire state (or a relevant slice) is snapshotted before each change and restored on undo. Simpler to implement because no inverse logic is required, but carries memory and copying overhead on every change.
+
+trakr uses the **Command pattern** because, once correctly implemented, it is strictly more efficient: no memory overhead, no copying, and undo granularity is exactly as fine or coarse as designed.
+
+### How undo steps are created
+
+Every tracked write — a `@Tracked()` property assignment or a `TrackedCollection` mutation — becomes its own undo step unless it is automatically composed into an existing one (see [Automatic composing](#automatic-composing) below).
+
+```
+invoice.status = 'void'          → undo step A
+invoice.lines.clear()            → undo step B   (independent)
+```
+
+### Automatic composing
+
+Multiple tracked writes can automatically land in the same undo step in three cases. No extra API is needed.
+
+**Case 1a — `@Tracked` setter body**
+
+When a property's setter is decorated with `@Tracked`, the setter body runs as part of the tracked write. Any `@Tracked` property writes or `TrackedCollection` mutations made synchronously inside that setter body are automatically composed into the same undo step.
+
+```typescript
+class NameModel extends TrackedObject {
+  private _firstName: string = '';
+  private _lastName: string = '';
+
+  get firstName(): string { return this._firstName; }
+  @Tracked() set firstName(value: string) { this._firstName = value; }
+
+  get lastName(): string { return this._lastName; }
+  @Tracked() set lastName(value: string) { this._lastName = value; }
+
+  get fullName(): string { return `${this._firstName} ${this._lastName}`.trim(); }
+  @Tracked() set fullName(value: string) {
+    const [first = '', last = ''] = value.split(' ');
+    this.firstName = first;  // composed — same undo step as fullName
+    this.lastName  = last;   // composed — same undo step as fullName
+  }
+}
+
+model.fullName = 'John Doe';
+
+tracker.undo(); // reverts firstName AND lastName together — one step
+```
+
+The same applies when the setter mutates a `TrackedCollection`:
+
+```typescript
+class TagModel extends TrackedObject {
+  private _tag: string = '';
+  readonly tags: TrackedCollection<string>;
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.tags = new TrackedCollection(tracker);
+  }
+
+  get tag(): string { return this._tag; }
+  @Tracked() set tag(value: string) {
+    this._tag = value;
+    if (value) this.tags.push(value); // composed — same undo step as tag
+  }
+}
+
+model.tag = 'active';
+
+tracker.undo(); // reverts tag AND removes 'active' from tags — one step
+```
+
+**Case 1b — `@Tracked` with `onChange` callback**
+
+When side-effect logic needs to be kept separate from the setter body — or when using `accessor` fields where there is no setter body — pass an `onChange` callback as the second argument to `@Tracked()`. It receives `(self, newValue, oldValue)` and runs inside the tracked operation, so any `@Tracked` property writes or `TrackedCollection` mutations made inside it are automatically composed into the same undo step. The callback does not fire during undo or redo — the stored actions handle replay.
+
+```typescript
+class TagModel extends TrackedObject {
+  readonly tags: TrackedCollection<string>;
+
+  @Tracked(
+    undefined,
+    (self: TagModel, newValue, oldValue) => {
+      if (oldValue) self.tags.remove(oldValue);
+      if (newValue) self.tags.push(newValue);  // composed — same undo step as tag
+    },
+  )
+  accessor tag: string = '';
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.tags = new TrackedCollection(tracker);
+  }
+}
+
+model.tag = 'active';
+
+tracker.undo(); // reverts tag AND removes 'active' from tags — one step
+```
+
+**Case 2 — `TrackedCollection` event callbacks**
+
+When a `TrackedCollection` is mutated, both its `changed` and `trackedChanged` events fire synchronously inside the tracked operation. Any `@Tracked` property write made inside either subscriber is automatically composed into the same undo step as the collection mutation.
+
+Use `changed` when you also want the callback to run during undo and redo. Use `trackedChanged` when you only want the callback to run on direct user mutations — it will not fire during undo or redo, and writes inside it are still composed on the initial write.
+
+```typescript
+// Using changed — fires on initial write, undo, and redo
+class OrderModel extends TrackedObject {
+  @Tracked() accessor itemCount: number = 0;
+
+  readonly items: TrackedCollection<string>;
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.items = new TrackedCollection(tracker);
+    this.items.changed.subscribe(() => {
+      this.itemCount = this.items.length; // composed into the same undo step
+    });
+  }
+}
+
+order.items.push('x');  // itemCount becomes 1
+tracker.undo();         // items back to [], itemCount back to 0
+
+// Using trackedChanged — fires only on initial write, writes still composed
+class LoggedCollection extends TrackedObject {
+  @Tracked() accessor lastAdded: string = '';
+
+  readonly items: TrackedCollection<string>;
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.items = new TrackedCollection(tracker);
+    this.items.trackedChanged.subscribe((e) => {
+      if (e.added.length > 0) this.lastAdded = e.added[e.added.length - 1]; // composed
+    });
+  }
+}
+```
+
+The same applies to `TrackedObject.trackedChanged`. A subscriber that writes to another `@Tracked` property is composed into the same undo step:
+
+```typescript
+class TitleModel extends TrackedObject {
+  @Tracked() accessor summary: string = '';
+
+  private _title: string = '';
+  get title(): string { return this._title; }
+  @Tracked() set title(value: string) { this._title = value; }
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+    this.trackedChanged.subscribe(({ property, newValue }) => {
+      if (property === 'title') {
+        this.summary = `Summary: ${newValue}`; // composed into the same undo step
+      }
+    });
+  }
+}
+
+model.title = 'Hello';
+tracker.undo(); // reverts title AND summary together
+```
+
+### Coalescing consecutive writes
+
+Rapid consecutive writes to the same `string` or `number` property on the same model can be merged into a single undo step. Coalescing is **opt-in per property** via the `coalesceWithin` option on `@Tracked()`. Pass the maximum gap in milliseconds between two writes that should still be considered part of the same edit:
+
+```typescript
+@Tracked(undefined, undefined, { coalesceWithin: 3000 })
+accessor status: string = '';
+```
+
+```typescript
+invoice.status = 'd';
+invoice.status = 'dr';
+invoice.status = 'dra';
+invoice.status = 'draft';
+
+tracker.undo(); // reverts all four at once → status = ''
+```
+
+Properties without `coalesceWithin` — and all `Date`, `boolean`, and `object` properties — are never coalesced; every write produces its own undo step.
+
+### Manual composing
+
+When you need to group any set of writes — across multiple properties, objects, or collections — into a single undo step, use the manual composing API:
+
+```typescript
+tracker.startComposing();
+
+model.firstName = 'Alice';
+model.lastName  = 'Smith';
+model.email     = 'alice@example.com';
+
+tracker.endComposing(); // all three writes become one undo step
+
+tracker.undo(); // reverts firstName, lastName, and email together
+```
+
+Call `rollbackComposing()` instead of `endComposing()` to revert all changes made since `startComposing()`:
+
+```typescript
+tracker.startComposing();
+
+model.firstName = 'Alice';
+model.lastName  = 'Smith';
+
+tracker.rollbackComposing(); // all writes since startComposing are reverted
+```
+
+A second call to `startComposing()` while a session is already active is a no-op — nesting is not supported.
+
+**Typical use case — edit modal**
+
+Open a modal that edits a slice of the model. If the user confirms, the entire set of edits lands in the undo history as one step. If the user cancels, all edits are rolled back invisibly.
+
+```typescript
+function openEditModal(model: PersonModel) {
+  tracker.startComposing();
+
+  showModal({
+    model,
+    onConfirm: () => tracker.endComposing(),
+    onCancel:  () => tracker.rollbackComposing(),
+  });
+}
+```
+
+### Dependency tracking
+
+Validators can read other properties of the same model — for example, a `scheduleDays` field might be required only when `isEnabled` is `true`. trakr automatically tracks which properties each validator reads, and re-runs only the affected validators when those properties change.
+
+This works via a lightweight dependency tracking mechanism built into the `@Tracked` getter. Every time a validator runs, trakr collects every `@Tracked` property that is read during the call. These are recorded as dependencies. When any of those properties is written next, only the validators that declared a dependency on it are re-evaluated — not the entire model.
+
+**Consequence for `get`/`set` pairs:** The dependency is registered through the getter, not the setter. If a property is written via a plain setter and its getter is not decorated with `@Tracked`, any validator that reads it will not discover the dependency — and will not re-run when the property changes.
+
+```typescript
+// WRONG — isEnabled getter is plain; validators that read self.isEnabled
+// will not re-run when isEnabled changes
+get isEnabled(): boolean { return this._isEnabled; }
+
+@Tracked()
+set isEnabled(value: boolean) { this._isEnabled = value; }
+```
+
+```typescript
+// CORRECT — both getter and setter are decorated
+@Tracked()
+get isEnabled(): boolean { return this._isEnabled; }
+
+@Tracked()
+set isEnabled(value: boolean) { this._isEnabled = value; }
+```
+
+When using `accessor` fields this is never an issue — the getter and setter share the same decoration.
+
+### Validation
+
+Validators are inline functions passed as the first argument to `@Tracked()`. They receive the model instance and the incoming value and return an error string on failure or `undefined` on success.
+
+trakr runs validators automatically — you never call them directly. They run:
+
+- After every tracked write to the decorated property
+- After every undo and redo
+- Once for every property on every model after `tracker.construct()` completes
+
+Results are stored per-property in `model.validationMessages: Map<string, string>` and aggregated into:
+
+- `model.isValid: boolean` — `true` when all validators on this model pass
+- `tracker.isValid: boolean` — `true` when every model and collection passes
+- `tracker.canCommit: boolean` — `true` when `isDirty && isValid`
+
+`tracker.isValidChanged` and `tracker.canCommitChanged` fire whenever these values change, so UI can bind directly to them without polling.
+
+**Collection validators** are a separate function passed as the third argument to the `TrackedCollection` constructor. They receive the full array and return an error string or `undefined`. The result is exposed on `collection.error` and `collection.isValid`, and rolls up into `tracker.isValid`.
+
+```typescript
+const items = new TrackedCollection<string>(
+  tracker,
+  [],
+  (list) => list.length === 0 ? 'At least one item is required' : undefined,
+);
+
+items.isValid; // false — empty
+items.push('a');
+items.isValid; // true
+```
+
+### Construction via tracker.construct()
+
+All tracked model objects must be created inside `tracker.construct()`. This call:
+
+- Suppresses tracking for the entire constructor body — property writes during construction are silently applied without creating undo entries
+- Validates every object once after construction
+- Calls `tracker.revalidate()` exactly once at the end, keeping bulk creation O(n)
+
+The tracker is clean and `canUndo` is `false` immediately after `tracker.construct()` returns.
+
+```typescript
+// Single object — returns the constructed instance
+const invoice = tracker.construct(() => new InvoiceModel(tracker));
+
+// Multiple objects — pass them all in one callback
+tracker.construct(() => {
+  for (const row of serverRows) {
+    const item = new ItemModel(tracker);
+    item.name = row.name; // suppressed — not tracked
+  }
+});
+// tracker.revalidate() is called once here — not once per object
+```
+
+### Development vs production builds
+
+trakr ships two builds: a development build (`dist/dev/`) and a production build (`dist/prod/`).
+
+**Development build** — creating a tracked object outside `tracker.construct()` throws immediately with a descriptive error:
+
+```
+MyModel must be created inside tracker.construct()
+```
+
+This catches accidental bare `new MyModel(tracker)` calls at the earliest possible moment during development.
+
+**Production build** — the construction guard is compiled away entirely. There is zero runtime overhead for the check.
+
+**Build selection is automatic.** Bundlers that support the `exports` field in `package.json` — Vite, webpack 5+, and others — pick the development build when building in development mode and the production build when building for production. Nothing extra is required from consumers; the correct build is selected via the `development` export condition in trakr's `package.json`.
+
+### Default state: Unchanged
+
+`TrackedObject` defaults to `Unchanged` at construction time. This matches the most common scenario — objects are loaded from the database and are already persisted.
+
+```typescript
+const item = tracker.construct(() => new ItemModel(tracker)); // state: Unchanged (DB-loaded default)
+```
+
+To create a **new** item that needs to be inserted, add it to a `TrackedCollection` via `push`. The collection is responsible for transitioning the object to `Insert`:
+
+```typescript
+const item = tracker.construct(() => new ItemModel(tracker));
+items.push(item);          // state: Insert — tracked, undoable
+tracker.undo();            // state: Unchanged, removed from collection
+```
+
+Items passed to the `TrackedCollection` **constructor** are treated as already-persisted rows and are **not** marked as `Insert`:
+
+```typescript
+const items = new TrackedCollection<ItemModel>(tracker, [dbItem]); // dbItem stays Unchanged
+```
+
+### Insert/Delete lifecycle
+
+State transitions to `Insert` and `Deleted` are triggered by two mechanisms: collection mutations and `@Tracked` property assignments.
+
+**Via TrackedCollection**
+
+Adding or removing a `TrackedObject` from a `TrackedCollection` transitions its state automatically:
+
+```typescript
+const item = tracker.construct(() => new ItemModel(tracker)); // Unchanged
+items.push(item);   // → Insert
+items.remove(item); // → Unchanged (was never saved)
+
+const loaded = tracker.construct(() => new ItemModel(tracker, { id: 1 })); // Unchanged
+items.push(loaded);   // → Insert
+items.remove(loaded); // → Deleted
+```
+
+**Via @Tracked property**
+
+When a `@Tracked` property holds a `TrackedObject` value, assigning to it has the same effect: the outgoing value transitions to `Deleted` (or `Unchanged` if it was `Insert`), and the incoming value transitions to `Insert`:
+
+```typescript
+class OrderModel extends TrackedObject {
+  @Tracked()
+  accessor detail: DetailModel | null = null;
+
+  constructor(tracker: Tracker) { super(tracker); }
+}
+
+const order = tracker.construct(() => new OrderModel(tracker));
+const detail = tracker.construct(() => new DetailModel(tracker)); // Unchanged
+
+order.detail = detail; // detail → Insert
+order.detail = null;   // detail → Deleted
+```
+
+Setting a new value while one is already assigned marks the old one removed and the new one added in the same undo step:
+
+```typescript
+const detail2 = tracker.construct(() => new DetailModel(tracker));
+order.detail = detail2; // detail → Deleted, detail2 → Insert (one undo step)
+tracker.undo();         // detail2 → Unchanged, detail → Insert
+```
+
+**Suppression**
+
+State transitions respect tracking suppression. Inside `tracker.construct()` and `tracker.withTrackingSuppressed()`, collection mutations and property assignments are applied silently without state transitions. This means loading data inside `tracker.construct()` never accidentally marks objects as `Insert` or `Deleted`.
+
+### Object state machine
+
+Every `TrackedObject` has a `state: State` property — the single source of truth for what the save layer needs to do with that object. State transitions are driven by three types of events:
+
+- **edit** — a `@Tracked` property is written
+- **collection mutation** — the object is pushed to or removed from a `TrackedCollection`
+- **commit** — `tracker.onCommit()` is called after a successful server save
+
+#### Redo is always the same as do
+
+There is no separate redo transition. Redo simply re-runs the original `do` action. This means `added/do` and `added/redo` are identical — both assign a **fresh** `idPlaceholder`. Placeholders from a previous do/undo cycle are never reused.
+
+#### Full transition table
+
+| Event | Direction | From | To | `idPlaceholder` | `@AutoId` field |
+|---|---|---|---|---|---|
+| edit | do / redo | Unchanged | **Changed** | null | untouched |
+| edit | do / redo | Changed | Changed | null | untouched |
+| edit | undo (last edit) | Changed | **Unchanged** | null | untouched |
+| edit | undo (not last) | Changed | Changed | null | untouched |
+| added | do / redo | Unchanged | **Insert** | new negative | untouched |
+| added | undo | Insert | **Unchanged** | null | untouched |
+| removed | do / redo | Insert | **Unchanged** | null, dirtyCounter reset | untouched |
+| removed | do / redo | Unchanged | **Deleted** | null | untouched |
+| removed | undo | Unchanged (was Insert) | **Insert** | new negative | untouched |
+| removed | undo | Deleted | **Unchanged** | null | untouched |
+| committed | do / redo | Insert | **Unchanged** | null | written with real id |
+| committed | do / redo | Changed | **Unchanged** | null | untouched |
+| committed | do / redo | Deleted | **Unchanged** | null | untouched |
+| committed | undo | was Insert | **Deleted** | null | kept (real id for DELETE) |
+| committed | undo | was Changed | **Changed** | null | untouched |
+| committed | undo | was Deleted | **Insert** | new negative | kept (stale — use `idPlaceholder`) |
+
+#### Key notes
+
+**`removed/do` from `Insert` collapses to `Unchanged`** — if an object was added and then removed before ever being committed, it was never persisted. The transition resets `dirtyCounter` to zero and clears `idPlaceholder` as if the add never happened. Nothing needs to be sent to the server.
+
+**`committed/undo` reverses the server operation** — undoing past a commit puts the object into the state that requires the inverse server operation. Undoing a committed INSERT requires a DELETE; undoing a committed DELETE requires a new INSERT; undoing a committed UPDATE requires another UPDATE with the pre-edit values.
+
+**`@AutoId` is never zeroed out** — when `committed/undo` runs after a committed INSERT, the real server id stays on the `@AutoId` field so the save layer can send `DELETE /resource/{id}`. Similarly, after `committed/undo` of a DELETE, the `@AutoId` field still holds the old real id — but since `state` is now `Insert`, the save layer must use `idPlaceholder` as the POST key, not `@AutoId`.
+
+**`idPlaceholder` for `Insert` items** — always use `obj.idPlaceholder` (never `obj.@AutoId`) to identify an `Insert` item in the save payload. After a `committed delete → undo` cycle, `@AutoId` holds a stale real id while `idPlaceholder` holds the correct fresh temp key.
+
+### Recommended save pattern
+
+trakr does not mandate a specific save strategy — you can send changes per-object, batch selectively, or structure your API however your application requires.
+
+That said, a pattern that works well with trakr's design is **all-or-nothing saves**: when the user clicks Save, the frontend collects every dirty object across the tracker, serialises them into a single request, and the backend saves everything inside one transaction — either succeeding fully or returning an error without applying partial changes. The frontend then calls `tracker.onCommit()` only on success.
+
+This pairs naturally with `@AutoId`: `idPlaceholder` values are automatically assigned as negative integers when an object is added to a collection. New objects can reference each other via their `idPlaceholder` in the payload (e.g. a new parent and its new children share consistent temp IDs before the server assigns real ones). After a successful save, `tracker.onCommit(keys)` swaps the placeholders for real server IDs in place — no page reload is needed. This is the intended experience for form-heavy back-office pages, though reloading or restructuring state on save is equally valid.
+
+**On failure, do not call `onCommit()`.**
+
+If the server returns an error, simply surface the error to the user and leave the tracker as-is. The tracker stays dirty, `canUndo` remains `true`, and the user can fix the problem and try again — or undo their changes. Nothing needs to be reset manually.
+
+---
+
+## API Reference
+
+### `Tracker`
+
+The central coordinator. Create one per page or form context and pass it to every model and collection.
+
+```typescript
+const tracker = new Tracker();
+```
+
+**State properties**
+
+| Property | Type | Description |
+|---|---|---|
+| `isDirty` | `boolean` | `true` when uncommitted changes exist |
+| `canUndo` | `boolean` | `true` when there is at least one undo step |
+| `canRedo` | `boolean` | `true` when there are undone steps to redo |
+| `isValid` | `boolean` | `true` when every registered model and collection passes validation |
+| `canCommit` | `boolean` | `true` when `isDirty && isValid` — ready to submit to the server |
+| `isDirtyChanged` | `TypedEvent<boolean>` | Fires whenever `isDirty` changes |
+| `isValidChanged` | `TypedEvent<boolean>` | Fires whenever `isValid` changes |
+| `canCommitChanged` | `TypedEvent<boolean>` | Fires whenever `canCommit` changes |
+| `version` | `number` | Monotonically changing counter — starts at `0`, increments on every new operation, decrements on undo, increments on redo. Auto-coalesced writes do not increment `version` (no new undo step is created) but still emit `versionChanged` |
+| `versionChanged` | `TypedEvent<number>` | Fires on every tracked write, undo, and redo — including auto-coalesced writes where `version` does not change. Use this as the notification signal for external subscribers such as React's `useSyncExternalStore` |
+| `trackedObjects` | `TrackedObject[]` | All registered models. Read-only — iterate for save payloads; do not mutate directly |
+| `deletedObjects` | `TrackedObject[]` | Subset of `trackedObjects` where `state === Deleted`. Use this to build delete requests — deleted objects are removed from collections and composed properties, making them unreachable from the model tree |
+| `trackedCollections` | `TrackedCollection<any>[]` | All registered collections. Read-only — do not mutate directly |
+
+**Undo / redo**
+
+```typescript
+tracker.undo();  // reverts the last undo step
+tracker.redo();  // re-applies the last undone step
+```
+
+Calling `undo()` or `redo()` when the respective flag is `false` is a no-op.
+
+**Commit lifecycle**
+
+```typescript
+tracker.onCommit();           // mark current state as committed — isDirty → false
+tracker.onCommit(keys);       // same, plus swap placeholder IDs for real server IDs
+```
+
+`onCommit()` automatically transitions every tracked object's `state` to `Unchanged` and appends the state change into the existing last undo operation — so undo atomically reverts both the user's edits and the committed state together (no spurious extra undo steps).
+
+**Manual composing**
+
+```typescript
+tracker.startComposing();    // begin grouping subsequent changes
+tracker.endComposing();      // commit — all changes become one undo step
+tracker.rollbackComposing(); // revert — all changes since startComposing are rolled back
+```
+
+**Object construction**
+
+```typescript
+// Single object — returns the constructed instance
+const model = tracker.construct(() => new MyModel(tracker));
+
+// Multiple objects — returns void
+tracker.construct(() => {
+  new ModelA(tracker);
+  new ModelB(tracker);
+});
+```
+
+`tracker.construct()` suppresses tracking for the entire callback, runs validators once after all objects are created, and calls `tracker.revalidate()` exactly once at the end.
+
+**Tracking suppression**
+
+```typescript
+// Callback form — preferred
+tracker.withTrackingSuppressed(() => {
+  model.field = 'silent';   // applied but not recorded, not dirty
+});
+
+// Explicit begin/end — useful when the suppressed block spans async boundaries
+tracker.beginSuppressTracking();
+model.field = 'silent';
+tracker.endSuppressTracking();
+```
+
+Suppression is **nestable** via a counter, so calling `beginSuppressTracking()` twice requires two `endSuppressTracking()` calls to resume tracking.
+
+**React integration — `useSyncExternalStore`**
+
+`version` and `versionChanged` are designed to plug directly into React's `useSyncExternalStore`. Subscribe to `versionChanged` as the store and snapshot `tracker.version` — any component that calls the hook will automatically re-render on every tracked mutation, undo, or redo with no bridging code required:
+
+```typescript
+import { useSyncExternalStore } from 'react';
+import { Tracker } from '@katn30/trakr';
+
+function useTrackerVersion(tracker: Tracker): number {
+  return useSyncExternalStore(
+    (onStoreChange) => tracker.versionChanged.subscribe(onStoreChange),
+    () => tracker.version,
+  );
+}
+```
+
+Any component that calls `useTrackerVersion(tracker)` will re-render whenever the tracker's state changes.
+
+```tsx
+function InvoiceForm({ tracker, invoice }: { tracker: Tracker; invoice: InvoiceModel }) {
+  useTrackerVersion(tracker); // re-renders on every mutation, undo, or redo
+
+  return (
+    <form>
+      <input value={invoice.status} onChange={(e) => { invoice.status = e.target.value; }} />
+      <button disabled={!tracker.canUndo} onClick={() => tracker.undo()}>Undo</button>
+      <button disabled={!tracker.canCommit} onClick={save}>Save</button>
+    </form>
+  );
+}
+```
+
+---
+
+### `TrackedObject`
+
+The abstract base class for all trackable models. All subclass instances must be created via `tracker.construct()`.
+
+```typescript
+class InvoiceModel extends TrackedObject {
+  constructor(tracker: Tracker) {
+    super(tracker); // registers the model with the tracker
+  }
+}
+
+const invoice = tracker.construct(() => new InvoiceModel(tracker));
+```
+
+**Model properties and methods**
+
+| Member | Type | Description |
+|---|---|---|
+| `tracker` | `Tracker` | The tracker this model belongs to (set via `super(tracker)`) |
+| `state` | `State` | The current persistence state — `Unchanged`, `Insert`, `Changed`, or `Deleted` |
+| `idPlaceholder` | `number \| null` | Negative temp key assigned automatically when the object is added to a `TrackedCollection`. `null` when state is not `Insert`. Always use this (not the `@AutoId` field) as the POST key for `Insert` items |
+| `isDirty` | `boolean` | `true` when this model has uncommitted property changes |
+| `dirtyCounter` | `number` | Net count of uncommitted property writes. Increments on each write, decrements on undo. Reset to `0` by `onCommit()`. Can be negative after undoing past a committed save |
+| `isValid` | `boolean` | `true` when all `@Tracked()` validators pass |
+| `validationMessages` | `Map<string, string>` | Maps property name → error message for each failing validator |
+| `changed` | `TypedEvent<TrackedPropertyChanged>` | Fires on every property change, including changes triggered by undo and redo |
+| `trackedChanged` | `TypedEvent<TrackedPropertyChanged>` | Fires only on direct user-initiated writes — never during undo or redo |
+| `destroy()` | `void` | Removes this model from the tracker |
+
+**Property change events**
+
+Both `changed` and `trackedChanged` carry a `TrackedPropertyChanged` payload:
+
+```typescript
+import type { TrackedPropertyChanged } from '@katn30/trakr';
+// { property: string; oldValue: unknown; newValue: unknown }
+```
+
+| Field | Description |
+|---|---|
+| `property` | The decorated property name |
+| `oldValue` | The value before the write |
+| `newValue` | The value after the write |
+
+Both events fire synchronously **inside** the tracked operation, so any `@Tracked` property write made inside either listener is automatically composed into the same undo step as the triggering write (see [Automatic composing](#automatic-composing)).
+
+The difference is when they fire:
+- `changed` fires on every write, including during undo and redo replays
+- `trackedChanged` fires only on direct user-initiated writes — never during undo or redo
+
+```typescript
+// changed — fires on initial write, undo, and redo; writes in callback are composed
+this.changed.subscribe(({ property }) => {
+  if (property === 'price' || property === 'quantity') {
+    this.total = this.price * this.quantity; // composed into the same undo step
+  }
+});
+
+// trackedChanged — fires only on initial write; writes in callback are still composed
+this.trackedChanged.subscribe(({ property, newValue }) => {
+  if (property === 'title') {
+    this.summary = `Summary: ${newValue}`; // composed on initial write only
+  }
+});
+```
+
+---
+
+### `State`
+
+Read via `obj.state`.
+
+```typescript
+import { State } from '@katn30/trakr';
+```
+
+| Value | Meaning | Required DB operation |
+|---|---|---|
+| `Unchanged` | Loaded from DB or just saved — no pending action | — |
+| `Insert` | Added to a collection, never committed | INSERT |
+| `Changed` | Loaded or committed, then edited | UPDATE |
+| `Deleted` | Removed from a collection | DELETE |
+
+For the full set of transitions between these states — driven by edits, collection mutations, undo, redo, and commit — see [Object state machine](#object-state-machine) in Concepts.
+
+**Loading from DB:**
+
+Objects default to `Unchanged`. Property values set inside the constructor are suppressed by `tracker.construct()`:
+
+```typescript
+class InvoiceModel extends TrackedObject {
+  @Tracked() accessor status: string = '';
+  constructor(tracker: Tracker, data?: { status: string }) {
+    super(tracker);
+    if (data) this.status = data.status; // suppressed — not tracked
+  }
+}
+
+const invoice = tracker.construct(() => new InvoiceModel(tracker, { status: 'active' })); // state: Unchanged
+```
+
+**Saving:**
+
+Iterate `tracker.trackedObjects`, read `state` and the appropriate ID on each model, and call `tracker.onCommit()` after the server responds successfully.
+
+> **Why `tracker.trackedObjects` and not your own model tree?**
+> Deleted objects are no longer reachable through your model graph — a `TrackedCollection` removes them from its array, and a `@Tracked` property set to `null` (or replaced with another object) removes the reference. The tracker holds every registered object regardless of its state, so iterating `trackedObjects` is the only way to reach objects that need a DELETE request. `tracker.deletedObjects` is a convenience getter for the deleted subset only, but both approaches work.
+
+```typescript
+import { Tracker, TrackedObject, State, Tracked, AutoId, TrackedCollection } from '@katn30/trakr';
+
+class InvoiceModel extends TrackedObject {
+  @AutoId
+  id: number = 0;
+
+  @Tracked()
+  accessor status: string = '';
+
+  constructor(tracker: Tracker, data?: { id: number; status: string }) {
+    super(tracker);
+    if (data) {
+      this.id = data.id;
+      this.status = data.status;
+    }
+  }
+}
+
+const tracker = new Tracker();
+
+// Load existing rows from the server
+tracker.construct(() => {
+  new InvoiceModel(tracker, { id: 1, status: 'draft' });
+  new InvoiceModel(tracker, { id: 2, status: 'sent' });
+});
+
+// Create a new invoice and add it to a collection (state → Insert, idPlaceholder auto-assigned)
+const invoices = new TrackedCollection<InvoiceModel>(tracker);
+const newInvoice = tracker.construct(() => new InvoiceModel(tracker));
+invoices.push(newInvoice);
+newInvoice.status = 'pending';
+// newInvoice.idPlaceholder === -1  (auto-assigned negative temp key)
+
+// --- Save ---
+
+// Build the payload by reading each object's state
+const payload: {
+  inserts: { placeholder: number; status: string }[];
+  updates: { id: number; status: string }[];
+  deletes: { id: number }[];
+} = { inserts: [], updates: [], deletes: [] };
+
+for (const obj of tracker.trackedObjects) {
+  if (!(obj instanceof InvoiceModel)) continue;
+  switch (obj.state) {
+    case State.Insert:
+      // Use idPlaceholder — NOT obj.id, which may hold a stale real server id
+      payload.inserts.push({ placeholder: obj.idPlaceholder!, status: obj.status });
+      break;
+    case State.Changed:
+      payload.updates.push({ id: obj.id, status: obj.status });
+      break;
+    case State.Deleted:
+      payload.deletes.push({ id: obj.id });
+      break;
+    case State.Unchanged:
+      break;
+  }
+}
+
+// Send to server — backend runs everything in one transaction
+const response = await api.save(payload);
+// response.ids: [{ placeholder: -1, value: 42 }]
+
+// Apply real IDs and mark everything clean — no page reload needed
+tracker.onCommit(response.ids);
+// newInvoice.id === 42, state === Unchanged
+// tracker.isDirty === false
+
+// When no new objects were created, keys can be omitted:
+// tracker.onCommit();
+```
+
+---
+
+### `@AutoId`
+
+Marks a property as the server-assigned autoincrement primary key for this model. Only one `@AutoId` field is allowed per class. Enables the `onCommit` lifecycle for real-ID assignment.
+
+```typescript
+class InvoiceModel extends TrackedObject {
+  @AutoId
+  id: number = 0;
+
+  @Tracked()
+  accessor status: string = '';
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+```
+
+When a new object is added to a `TrackedCollection`, a **negative placeholder ID** is automatically assigned to `idPlaceholder` on the `TrackedObject`. The `@AutoId` field itself is left at its initial value until a real server ID arrives. This separation matters: after undo/redo cycles the `@AutoId` field may hold a stale real server ID — the save layer must always use `idPlaceholder` when the state is `Insert`.
+
+**Typical save flow:**
+
+```typescript
+const invoice = tracker.construct(() => new InvoiceModel(tracker));
+invoices.push(invoice);
+// invoice.idPlaceholder === -1  (auto-assigned when pushed)
+// invoice.id            === 0   (untouched by the library)
+
+invoice.status = 'draft';
+
+// 1. Build payload — use idPlaceholder for Insert items:
+const serverIds = [{ placeholder: invoice.idPlaceholder!, value: 42 }];
+
+// 2. Send to server, receive real IDs back.
+
+// 3. Apply real IDs and mark clean:
+tracker.onCommit(serverIds);
+// invoice.id            === 42  (written by onCommit)
+// invoice.idPlaceholder === null
+// tracker.isDirty       === false
+```
+
+`onCommit()` with no arguments (or an empty array) still marks the tracker as clean — it just skips the ID replacement step.
+
+The placeholder counter never resets — each cycle continues from where it left off — so `idPlaceholder` values are globally unique across the lifetime of the tracker and can never collide across save cycles.
+
+---
+
+### `ITracked`
+
+The common interface implemented by both `TrackedObject` and `TrackedCollection`. Useful for writing utility functions that accept either:
+
+```typescript
+import { ITracked } from '@katn30/trakr';
+
+function isReady(item: ITracked): boolean {
+  return item.isDirty && item.isValid;
+}
+```
+
+| Member | Type | Description |
+|---|---|---|
+| `tracker` | `Tracker` | The tracker this object belongs to |
+| `isDirty` | `boolean` | `true` when there are uncommitted changes |
+| `dirtyCounter` | `number` | Net count of uncommitted writes |
+| `state` | `State` | Current persistence state (always `Unchanged` for collections) |
+| `destroy()` | `void` | Removes this object from the tracker |
+
+---
+
+### `IdAssignment`
+
+The shape of each entry in the `keys` array passed to `tracker.onCommit(keys)`:
+
+```typescript
+import type { IdAssignment } from '@katn30/trakr';
+// { placeholder: number; value: number }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `placeholder` | `number` | The negative `idPlaceholder` value that was active at save time |
+| `value` | `number` | The real server-assigned ID to substitute in |
+
+The server returns one `IdAssignment` per inserted object. `onCommit()` matches each entry against the `idPlaceholder` of every tracked object and writes `value` to the `@AutoId` field of any match.
+
+---
+
+### `@Tracked()`
+
+The property decorator. Intercepts every write, records an undo/redo pair, and optionally validates the new value. Works with `accessor` fields, explicit `get`/`set` pairs, and plain getters. Place it on the **accessor**, the **setter**, or the **getter**.
+
+**With `accessor` (recommended):**
+
+```typescript
+class ProductModel extends TrackedObject {
+  @Tracked()
+  accessor name: string = '';
+
+  @Tracked()
+  accessor price: number = 0;
+
+  @Tracked()
+  accessor active: boolean = true;
+
+  @Tracked()
+  accessor config: Record<string, unknown> = {};
+
+  @Tracked()
+  accessor createdAt: Date = new Date();
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+```
+
+**With `get`/`set`** — decorate the setter:
+
+```typescript
+class ProductModel extends TrackedObject {
+  private _name: string = '';
+
+  get name(): string { return this._name; }
+
+  @Tracked()
+  set name(value: string) { this._name = value; }
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+```
+
+**With `get`/`set` and side effects** — decorate both getter and setter:
+
+When the setter contains side-effect logic that must stay intact (e.g. cascading writes to other properties), decorate both the getter and the setter. The getter decoration registers `isEnabled` as a dependency source — any validator that reads it will automatically re-run when the setter fires. The setter decoration handles undo/redo as usual.
+
+```typescript
+class RuleModel extends TrackedObject {
+  private _isEnabled: boolean = false;
+
+  @Tracked()
+  get isEnabled(): boolean { return this._isEnabled; }
+
+  @Tracked()
+  set isEnabled(value: boolean) {
+    this._isEnabled = value;
+    if (value) {
+      this.scheduleDays = 'mon';
+    } else {
+      this.scheduleDays = '';
+    }
+  }
+
+  @Tracked((self: RuleModel, v) =>
+    self.isEnabled && !v ? 'Day is required' : undefined
+  )
+  accessor scheduleDays: string = '';
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+```
+
+When `isEnabled` is set to `true`, `scheduleDays`'s validator automatically re-runs because the getter declared the dependency. No manual `revalidate()` call is needed.
+
+> Note: decorating just the getter (without the setter) is valid when the getter is purely computed — it registers the property as a dependency source without attaching any undo/redo logic.
+
+**With a validator:**
+
+The validator receives the model instance and the incoming value. Return an error string to fail, `undefined` to pass.
+
+```typescript
+class OrderModel extends TrackedObject {
+  @Tracked((self, value) => !value ? 'Status is required' : undefined)
+  accessor status: string = '';
+
+  @Tracked((self, value) => value < 0 ? 'Price must be positive' : undefined)
+  accessor price: number = 0;
+
+  // Validator can inspect other properties of the model
+  @Tracked((self: OrderModel, value) =>
+    value > self.price ? 'Discount exceeds price' : undefined
+  )
+  accessor discount: number = 0;
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+```
+
+Validators are re-evaluated after every tracked write and after every undo/redo. Results are stored in `model.validationMessages` and rolled up into `tracker.isValid`.
+
+Validators that read other properties automatically re-run when those properties change — this is handled by the dependency tracking mechanism (see [Dependency tracking](#dependency-tracking) in Concepts). For this to work, every property read inside a validator must be exposed through a `@Tracked`-decorated getter. `accessor` fields satisfy this automatically. For `get`/`set` pairs, both the getter and setter must be decorated with `@Tracked` — see the "getter + setter with side effects" example above.
+
+**No-op detection**
+
+Assigning the same value twice does not create an undo step and does not mark the model dirty. Equality is checked with strict `===` — `null`, `undefined`, and `''` are all distinct values.
+
+```typescript
+invoice.status = '';      // no-op (already '')
+invoice.status = null;    // recorded (null !== '')
+invoice.status = 'draft'; // recorded
+invoice.status = 'draft'; // no-op
+```
+
+**Signature**
+
+```typescript
+@Tracked(validator?, onChange?, options?)
+```
+
+| Parameter | Type | Applies to | Description |
+|---|---|---|---|
+| `validator` | `(self, newValue) => string \| undefined` | accessor, setter | Returns an error string on failure, `undefined` on success |
+| `onChange` | `(self, newValue, oldValue) => void` | accessor, setter | Side-effect callback. Runs inside the tracked operation — writes to other `@Tracked` properties or `TrackedCollection`s are composed into the same undo step. Does not fire during undo or redo |
+| `options.coalesceWithin` | `number` | accessor, setter | Maximum gap in ms between two consecutive writes to merge into one undo step. Omit to never coalesce |
+
+```typescript
+// validator only:
+@Tracked((_, v) => v < 0 ? 'Must be positive' : undefined)
+accessor price: number = 0;
+
+// onChange only — side effects composed into the same undo step:
+@Tracked(
+  undefined,
+  (self: TagModel, newValue, oldValue) => {
+    if (oldValue) self.tags.remove(oldValue);
+    if (newValue) self.tags.push(newValue);
+  },
+)
+accessor tag: string = '';
+
+// validator + onChange + coalesceWithin:
+@Tracked(
+  (_, v) => !v ? 'Required' : undefined,
+  (self: MyModel, newValue) => { self.log.push(newValue); },
+  { coalesceWithin: 3000 },
+)
+accessor name: string = '';
+
+// coalesceWithin only:
+@Tracked(undefined, undefined, { coalesceWithin: 3000 })
+accessor status: string = '';
+```
+
+**Supported property types:** `string`, `number`, `boolean`, `Date`, `object`. Unsupported types throw at runtime.
+
+---
+
+### `TrackedCollection<T>`
+
+A fully array-compatible tracked collection. All mutations are recorded and undoable. Implements `Array<T>` so it works anywhere an array is expected.
+
+```typescript
+const items = new TrackedCollection<string>(tracker);
+
+// With initial items:
+const items = new TrackedCollection<string>(tracker, ['a', 'b']);
+
+// With a validator:
+const items = new TrackedCollection<string>(
+  tracker,
+  [],
+  (list) => list.length === 0 ? 'At least one item is required' : undefined,
+);
+```
+
+**Tracked mutation methods**
+
+All of these create undo steps:
+
+| Method | Description |
+|---|---|
+| `push(...items)` | Appends one or more items |
+| `pop()` | Removes and returns the last item |
+| `shift()` | Removes and returns the first item |
+| `unshift(...items)` | Prepends one or more items |
+| `splice(start, deleteCount, ...items)` | Low-level insert/remove at a position |
+| `remove(item)` | Removes a specific item by reference. Returns `false` if not found |
+| `replace(item, replacement)` | Replaces a specific item by reference. Returns `false` if not found |
+| `replaceAt(index, replacement)` | Replaces the item at a given index |
+| `clear()` | Removes all items |
+| `reset(newItems)` | Replaces the entire collection with a new array |
+| `fill(value, start?, end?)` | Fills a range with a value |
+| `copyWithin(target, start, end?)` | Copies a slice to another position |
+
+**Read-only / non-mutating methods**
+
+`indexOf`, `lastIndexOf`, `includes`, `find`, `findIndex`, `findLast`, `findLastIndex`, `every`, `some`, `forEach`, `map`, `filter`, `flatMap`, `reduce`, `reduceRight`, `concat`, `join`, `slice`, `at`, `entries`, `keys`, `values`, `flat`, `reverse`, `sort`, `toReversed`, `toSorted`, `toSpliced`, `with`, `toString`, `toLocaleString`
+
+**Additional properties**
+
+| Member | Description |
+|---|---|
+| `length` | Number of items |
+| `isDirty` | `true` when the collection has unsaved mutations |
+| `isValid` | `true` when the validator passes (or no validator was provided) |
+| `error` | The current validation error message, or `undefined` |
+| `changed` | `TypedEvent<TrackedCollectionChanged<T>>` — fires on every mutation, including during undo and redo |
+| `trackedChanged` | `TypedEvent<TrackedCollectionChanged<T>>` — fires only on direct user-initiated mutations, never during undo or redo |
+| `first()` | Returns the first item, or `undefined` if empty |
+| `destroy()` | Removes the collection from the tracker |
+
+**Collection change events**
+
+Both events carry a `TrackedCollectionChanged<T>` payload:
+
+| Property | Description |
+|---|---|
+| `added` | Items that were inserted |
+| `removed` | Items that were removed |
+| `newCollection` | The full collection after the mutation |
+
+Both events fire synchronously **inside** the tracked operation, so any `@Tracked` property write made inside either listener is automatically composed into the same undo step as the collection mutation (see [Automatic composing](#automatic-composing)).
+
+The difference is when they fire:
+- `changed` fires on every mutation, including during undo and redo replays
+- `trackedChanged` fires only on direct user-initiated mutations — never during undo or redo
+
+```typescript
+// changed — fires on initial write, undo, and redo; writes in callback are composed
+items.changed.subscribe(() => {
+  this.itemCount = items.length;
+});
+
+// trackedChanged — fires only on initial write; writes in callback are still composed
+items.trackedChanged.subscribe((e) => {
+  this.lastAdded = e.added[e.added.length - 1] ?? ''; // composed on initial write only
+});
+```
+
+---
+
+### `TypedEvent<T>`
+
+A lightweight, strongly-typed event emitter. Used internally for `tracker.isDirtyChanged`, `tracker.isValidChanged`, `TrackedObject.changed`, `TrackedObject.trackedChanged`, `TrackedCollection.changed`, and `TrackedCollection.trackedChanged`, and available for your own use.
+
+```typescript
+const event = new TypedEvent<string>();
+
+// subscribe returns an unsubscribe function
+const unsubscribe = event.subscribe((value) => {
+  console.log('received:', value);
+});
+
+event.emit('hello');  // → "received: hello"
+
+unsubscribe();        // stop listening
+
+event.emit('world');  // → (nothing)
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `subscribe(handler)` | `() => void` | Registers a listener. Returns an unsubscriber |
+| `unsubscribe(handler)` | `void` | Removes a specific listener |
+| `emit(value)` | `void` | Calls all registered listeners with the given value |
+
+---
+
+## License
+
+MIT — Nazario Mazzotti
