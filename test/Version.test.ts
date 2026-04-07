@@ -48,12 +48,12 @@ describe("Tracker.version", () => {
     expect(tracker.version).toBe(2);
   });
 
-  it("does not increment when auto-coalescing into the same operation", () => {
+  it("increments on every write even when auto-coalescing into the same undo operation", () => {
     const t = new Tracker();
     const p = t.construct(() => new CoalescePersonModel(t));
     p.name = "Al";
     p.name = "Alice";
-    expect(t.version).toBe(1);
+    expect(t.version).toBe(2);
   });
 
   it("decrements by 1 on undo()", () => {
@@ -174,16 +174,16 @@ describe("Tracker.versionChanged", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it("fires for every write including auto-coalesced ones — version stays the same", () => {
+  it("fires for every write including auto-coalesced ones — version increments each time", () => {
     const t = new Tracker();
     const p = t.construct(() => new CoalescePersonModel(t));
     const received: number[] = [];
     t.versionChanged.subscribe((v) => received.push(v));
 
     p.name = "Al";    // new operation → version becomes 1
-    p.name = "Alice"; // coalesced → version stays 1, but event fires again
+    p.name = "Alice"; // coalesced into same undo op → version becomes 2
 
-    expect(received).toEqual([1, 1]);
+    expect(received).toEqual([1, 2]);
   });
 
   it("fires on every write even when auto-coalesced — model value changed", () => {

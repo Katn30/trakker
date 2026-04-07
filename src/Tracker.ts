@@ -213,6 +213,7 @@ export class Tracker {
 
       if (this.shouldCoalesceChanges(properties)) {
         this._currentOperation = CollectionUtilities.getLast(this._undoOperations)!;
+        this._version++;
         this.versionChanged.emit(this._version);
       } else {
         this._currentOperation = new Operation();

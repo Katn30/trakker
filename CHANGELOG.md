@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.1] — 2026-04-07
+
+### Bug fix: coalesced writes now always emit a version bump
+
+When a `@Tracked` property with `coalesceWithin` received a second change within the coalesce window, the model value was updated but `version` was not incremented. Subscribers using `useSyncExternalStore` (or any version-based observer) would therefore skip the re-render, leaving the UI out of sync with the model.
+
+**Root cause:** the coalesce branch in `Tracker._doAndTrack` called `versionChanged.emit(this._version)` without first incrementing `_version`.
+
+**Fix:** `_version` is now incremented unconditionally on every tracked write. Coalescing only affects the undo stack (rapid changes are merged into a single undo step); it is orthogonal to version / change-notification and no longer suppresses it.
+
+---
+
 ## [1.1.0] — 2026-04-07
 
 ### Breaking changes
