@@ -33,18 +33,18 @@ class OrderModel extends TrackedObject {
   }
 }
 
-// ---- endComposing ----
+// ---- session.end() ----
 
-describe("Tracker – endComposing", () => {
+describe("Tracker – session.end()", () => {
   it("merges multiple property changes into one undo step", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
     person.email = "alice@example.com";
-    tracker.endComposing();
+    session.end();
 
     expect(tracker.canUndo).toBe(true);
 
@@ -60,11 +60,11 @@ describe("Tracker – endComposing", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "A";
     person.lastName = "B";
     person.email = "c@d.com";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
     expect(tracker.canUndo).toBe(false);
@@ -74,10 +74,10 @@ describe("Tracker – endComposing", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
     tracker.redo();
@@ -92,10 +92,10 @@ describe("Tracker – endComposing", () => {
 
     person.email = "before@example.com";
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo(); // reverts firstName + lastName together
     expect(person.firstName).toBe("");
@@ -108,13 +108,13 @@ describe("Tracker – endComposing", () => {
     expect(tracker.canUndo).toBe(false);
   });
 
-  it("handles a single change inside the composing window (no merge needed)", () => {
+  it("handles a single change inside the session window (no merge needed)", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
     expect(person.firstName).toBe("");
@@ -125,8 +125,8 @@ describe("Tracker – endComposing", () => {
     const tracker = new Tracker();
     tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
-    tracker.endComposing();
+    const session = tracker.startSession();
+    session.end();
 
     expect(tracker.canUndo).toBe(false);
   });
@@ -138,10 +138,10 @@ describe("Tracker – endComposing", () => {
       order: new OrderModel(tracker),
     }));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     order.status = "draft";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
 
@@ -154,11 +154,11 @@ describe("Tracker – endComposing", () => {
     const tracker = new Tracker();
     const order = tracker.construct(() => new OrderModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     order.status = "draft";
     order.lines.push("line-1");
     order.lines.push("line-2");
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
 
@@ -167,15 +167,16 @@ describe("Tracker – endComposing", () => {
     expect(tracker.canUndo).toBe(false);
   });
 
-  it("second call to startComposing while already composing is a no-op", () => {
+  it("second call to startSession while a session is active returns the same session", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
-    tracker.startComposing(); // no-op
+    const session2 = tracker.startSession(); // no-op — returns same session
+    expect(session2).toBe(session);
     person.lastName = "Smith";
-    tracker.endComposing();
+    session.end();
 
     tracker.undo();
 
@@ -184,52 +185,40 @@ describe("Tracker – endComposing", () => {
     expect(tracker.canUndo).toBe(false);
   });
 
-  it("tracker is dirty after endComposing when changes were made", () => {
+  it("tracker is dirty after session.end() when changes were made", () => {
     const tracker = new Tracker();
     tracker.construct(() => new PersonModel(tracker));
     const person = tracker.trackedObjects[0] as PersonModel;
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
-    tracker.endComposing();
+    session.end();
 
     expect(tracker.isDirty).toBe(true);
   });
 
-  it("calling endComposing when not composing is a no-op", () => {
-    const tracker = new Tracker();
-    const person = tracker.construct(() => new PersonModel(tracker));
-
-    person.firstName = "Alice";
-    tracker.endComposing(); // not composing — should do nothing
-
-    expect(tracker.canUndo).toBe(true);
-    tracker.undo();
-    expect(person.firstName).toBe("");
-  });
-
-  it("isDirty is preserved after endComposing with no changes when tracker was already dirty", () => {
+  it("isDirty is preserved after session.end() with no changes when tracker was already dirty", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
     person.firstName = "Alice"; // tracker is dirty
 
-    tracker.startComposing();
-    tracker.endComposing(); // no changes inside
+    const session = tracker.startSession();
+    session.end(); // no changes inside
 
     expect(tracker.isDirty).toBe(true);
     expect(tracker.canUndo).toBe(true);
   });
 
-  it("single-change session: canRedo is false after endComposing when session undo cleared redo", () => {
+  it("single-change session: canRedo is false after session.end() when session undo cleared redo", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     tracker.undo(); // firstName undone → in redo; composed will have 0 ops, but this tests the single-op branch via a prior state
     person.lastName = "Smith"; // one op remains after undo clears redo
-    tracker.endComposing(); // composed=[lastName op] — single op, redo should be empty
+    session.end(); // composed=[lastName op] — single op, redo should be empty
 
     expect(tracker.canRedo).toBe(false);
   });
@@ -242,11 +231,11 @@ describe("Tracker – undo/redo during an active composing session", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
     tracker.undo(); // undo lastName — only firstName remains applied
-    tracker.endComposing();
+    session.end();
 
     expect(person.firstName).toBe("Alice");
     expect(person.lastName).toBe("");
@@ -256,27 +245,27 @@ describe("Tracker – undo/redo during an active composing session", () => {
     expect(tracker.canUndo).toBe(false);
   });
 
-  it("endComposing discards redo entries generated inside the session", () => {
+  it("session.end() discards redo entries generated inside the session", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     tracker.undo(); // firstName undone → sits in redo
-    tracker.endComposing(); // session closed with no net changes
+    session.end(); // session closed with no net changes
 
     // The redo entry from inside the session must not be accessible
     expect(tracker.canRedo).toBe(false);
   });
 
-  it("rollbackComposing discards redo entries generated inside the session", () => {
+  it("session.rollback() discards redo entries generated inside the session", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     tracker.undo(); // firstName undone → sits in redo
-    tracker.rollbackComposing();
+    session.rollback();
 
     // The redo entry from inside the session must not be accessible
     expect(tracker.canRedo).toBe(false);
@@ -290,9 +279,9 @@ describe("Tracker – undo/redo during an active composing session", () => {
     person.firstName = "Alice";
     tracker.undo(); // firstName in redo
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     // no writes inside
-    tracker.endComposing();
+    session.end();
 
     // pre-existing redo entry should still be there
     expect(tracker.canRedo).toBe(true);
@@ -301,18 +290,18 @@ describe("Tracker – undo/redo during an active composing session", () => {
   });
 });
 
-// ---- rollbackComposing ----
+// ---- session.rollback() ----
 
-describe("Tracker – rollbackComposing", () => {
+describe("Tracker – session.rollback()", () => {
   it("reverts all changes made since startComposing", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
     person.email = "alice@example.com";
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(person.firstName).toBe("");
     expect(person.lastName).toBe("");
@@ -323,34 +312,34 @@ describe("Tracker – rollbackComposing", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(tracker.canUndo).toBe(false);
   });
 
-  it("tracker is not dirty after rollbackComposing when it was clean before", () => {
+  it("tracker is not dirty after session.rollback() when it was clean before", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(tracker.isDirty).toBe(false);
   });
 
-  it("pre-existing undo steps are preserved after rollbackComposing", () => {
+  it("pre-existing undo steps are preserved after session.rollback()", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
     person.email = "before@example.com";
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.firstName = "Alice";
     person.lastName = "Smith";
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(person.firstName).toBe("");
     expect(person.lastName).toBe("");
@@ -361,25 +350,14 @@ describe("Tracker – rollbackComposing", () => {
     expect(person.email).toBe("");
   });
 
-  it("calling rollbackComposing when not composing is a no-op", () => {
-    const tracker = new Tracker();
-    const person = tracker.construct(() => new PersonModel(tracker));
-
-    person.firstName = "Alice";
-    tracker.rollbackComposing(); // not composing — should do nothing
-
-    expect(person.firstName).toBe("Alice");
-    expect(tracker.canUndo).toBe(true);
-  });
-
   it("with no changes inside the window, rollback is a no-op", () => {
     const tracker = new Tracker();
     const person = tracker.construct(() => new PersonModel(tracker));
 
     person.firstName = "Alice";
 
-    tracker.startComposing();
-    tracker.rollbackComposing();
+    const session = tracker.startSession();
+    session.rollback();
 
     expect(person.firstName).toBe("Alice");
     expect(tracker.canUndo).toBe(true);
@@ -389,11 +367,11 @@ describe("Tracker – rollbackComposing", () => {
     const tracker = new Tracker();
     const order = tracker.construct(() => new OrderModel(tracker));
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     order.status = "draft";
     order.lines.push("line-1");
     order.lines.push("line-2");
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(order.status).toBe("");
     expect(order.lines.length).toBe(0);
@@ -411,10 +389,10 @@ describe("Tracker – rollbackComposing", () => {
     expect(tracker.isValid).toBe(true);
     expect(tracker.canUndo).toBe(false);
 
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.email = ""; // makes invalid — first tracked write to this property
     expect(tracker.isValid).toBe(false);
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(person.email).toBe("valid@example.com");
     expect(tracker.isValid).toBe(true);

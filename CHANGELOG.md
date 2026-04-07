@@ -1,5 +1,54 @@
 # Changelog
 
+## [2.0.0] — 2026-04-07
+
+### Breaking changes
+
+**`startComposing()` renamed to `startSession()`**, and it now returns a `TrackerSession` instead of `void`.
+
+**`endComposing()` and `rollbackComposing()` removed from the public API.** Use `session.end()` and `session.rollback()` on the `TrackerSession` returned by `startSession()`.
+
+```typescript
+// 1.x
+tracker.startComposing();
+// ...
+tracker.endComposing();
+tracker.rollbackComposing();
+
+// 2.0
+const session = tracker.startSession();
+// ...
+session.end();
+session.rollback();
+```
+
+### New: `TrackerSession` with scoped `isDirty` and `isValid`
+
+`startSession()` accepts an optional **property scope** — a list of `[object, propertyNames]` tuples — and returns a `TrackerSession` whose `isDirty` and `isValid` are bounded to those properties.
+
+This is designed for edit modals where a save button must reflect only the state of the fields being edited, independently of the rest of the tracked graph:
+
+```typescript
+import { PropertyScope } from 'trakr';
+
+const session = tracker.startSession([
+  [model, ['firstName', 'lastName', 'email']],
+]);
+
+showModal({
+  onConfirm: () => session.end(),
+  onCancel:  () => session.rollback(),
+  canSave:   () => session.isDirty === true && session.isValid === true,
+});
+```
+
+- **`isDirty`** — `false` when the session starts; becomes `true` once the user writes to any declared property. Returns `undefined` when no scope is passed.
+- **`isValid`** — `false` if any declared property has a validation error, including pre-existing ones. Returns `undefined` when no scope is passed.
+
+The scope has no effect on what gets committed or rolled back: `session.end()` always merges all writes into one undo step, and `session.rollback()` always reverts them all.
+
+---
+
 ## [1.1.1] — 2026-04-07
 
 ### Bug fix: coalesced writes now always emit a version bump

@@ -10,6 +10,7 @@ import { validate, validateSingleProperty } from "./Registry";
 import { DependencyTracker, COLLECTION_VERSION_KEY } from "./DependencyTracker";
 import { ITracked } from "./ITracked";
 import { TrackedObject } from "./TrackedObject";
+import { TrackerSession, PropertyScope } from "./TrackerSession";
 
 export class Tracker {
   private _currentOperation: Operation | undefined;
@@ -29,6 +30,7 @@ export class Tracker {
   private _constructionDepth = 0;
   private _composingBaseIndex: number | undefined;
   private _composingRedoLength: number | undefined;
+  private _currentSession: TrackerSession | undefined;
   private _version: number = 0;
   public _isReplaying: boolean = false;
 
@@ -232,6 +234,12 @@ export class Tracker {
     );
     redoAction();
 
+    if (this._currentSession !== undefined &&
+        properties.property !== undefined &&
+        'validationMessages' in properties.trackedObject) {
+      this._currentSession._onWrite(properties.trackedObject, properties.property);
+    }
+
     if (this.isEndingCurrentOperation(properties)) {
       this._currentOperation = undefined;
       this._currentOperationOwner = undefined;
@@ -326,14 +334,21 @@ export class Tracker {
       this._commitStateOperation;
   }
 
-  public startComposing(): void {
-    if (this._composingBaseIndex !== undefined) return;
+  public startSession(scope?: PropertyScope[]): TrackerSession {
+    if (this._currentSession !== undefined) return this._currentSession;
     this._composingBaseIndex = this._undoOperations.length;
     this._composingRedoLength = this._redoOperations.length;
+    this._currentSession = new TrackerSession(
+      scope,
+      () => this.endComposing(),
+      () => this.rollbackComposing(),
+    );
+    return this._currentSession;
   }
 
-  public endComposing(): void {
+  private endComposing(): void {
     if (this._composingBaseIndex === undefined) return;
+    this._currentSession = undefined;
 
     const composed = this._undoOperations.splice(this._composingBaseIndex);
     this._redoOperations.splice(this._composingRedoLength!);
@@ -361,8 +376,9 @@ export class Tracker {
     this.reset();
   }
 
-  public rollbackComposing(): void {
+  private rollbackComposing(): void {
     if (this._composingBaseIndex === undefined) return;
+    this._currentSession = undefined;
 
     const toRevert = this._undoOperations.splice(this._composingBaseIndex);
     this._redoOperations.splice(this._composingRedoLength!);

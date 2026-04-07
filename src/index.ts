@@ -1,4 +1,6 @@
 export { Tracker } from './Tracker.js'
+export { TrackerSession } from './TrackerSession.js'
+export type { PropertyScope } from './TrackerSession.js'
 export { TrackedObject } from './TrackedObject.js'
 export type { TrackedPropertyChanged } from './TrackedObject.js'
 export { Tracked } from './Tracked.js'

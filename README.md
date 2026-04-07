@@ -263,50 +263,72 @@ tracker.undo(); // reverts all four at once → status = ''
 
 Properties without `coalesceWithin` — and all `Date`, `boolean`, and `object` properties — are never coalesced; every write produces its own undo step.
 
-### Manual composing
+### Sessions
 
-When you need to group any set of writes — across multiple properties, objects, or collections — into a single undo step, use the manual composing API:
+`startSession()` returns a `TrackerSession` that groups all writes made during the session into a single undo step. Call `session.end()` to commit or `session.rollback()` to revert:
 
 ```typescript
-tracker.startComposing();
+const session = tracker.startSession();
 
 model.firstName = 'Alice';
 model.lastName  = 'Smith';
 model.email     = 'alice@example.com';
 
-tracker.endComposing(); // all three writes become one undo step
+session.end(); // all three writes become one undo step
 
 tracker.undo(); // reverts firstName, lastName, and email together
 ```
 
-Call `rollbackComposing()` instead of `endComposing()` to revert all changes made since `startComposing()`:
-
 ```typescript
-tracker.startComposing();
+const session = tracker.startSession();
 
 model.firstName = 'Alice';
 model.lastName  = 'Smith';
 
-tracker.rollbackComposing(); // all writes since startComposing are reverted
+session.rollback(); // all writes since startSession are reverted
 ```
 
-A second call to `startComposing()` while a session is already active is a no-op — nesting is not supported.
+A second call to `startSession()` while a session is already active is a no-op — nesting is not supported.
 
-**Typical use case — edit modal**
+**Edit modal with save button**
 
-Open a modal that edits a slice of the model. If the user confirms, the entire set of edits lands in the undo history as one step. If the user cancels, all edits are rolled back invisibly.
+The canonical use case is a modal that edits a slice of the model. Pass a **property scope** — a list of `[object, propertyNames]` tuples — and the session exposes `isDirty` and `isValid` bounded to those properties, so a save button can be driven correctly regardless of the state of the rest of the application.
 
 ```typescript
+import { PropertyScope } from 'trakr';
+
 function openEditModal(model: PersonModel) {
-  tracker.startComposing();
+  const session = tracker.startSession([
+    [model, ['firstName', 'lastName', 'email']],
+  ]);
 
   showModal({
     model,
-    onConfirm: () => tracker.endComposing(),
-    onCancel:  () => tracker.rollbackComposing(),
+    onConfirm: () => session.end(),
+    onCancel:  () => session.rollback(),
+    canSave:   () => session.isDirty === true && session.isValid === true,
   });
 }
 ```
+
+**`isDirty`** is `false` when the session starts (even if other objects are already dirty elsewhere), and becomes `true` the moment the user writes to any property listed in the scope.
+
+**`isValid`** checks `validationMessages` for every declared property. If any has a validation error — including one that existed *before* the session started — `isValid` is `false`, keeping the save button disabled until the user resolves it.
+
+Both return `undefined` when `startSession()` is called without a scope argument.
+
+**Multiple objects in scope**
+
+Pass one tuple per object:
+
+```typescript
+const session = tracker.startSession([
+  [person,  ['firstName', 'email']],
+  [address, ['street', 'city']],
+]);
+```
+
+Properties not listed — and all other tracked objects — are ignored by `isDirty` and `isValid`. The scope has no effect on what gets committed or rolled back: `session.end()` always merges everything written since `startSession()` into one undo step, and `session.rollback()` always reverts it all.
 
 ### Dependency tracking
 
@@ -588,12 +610,13 @@ tracker.onCommit(keys);       // same, plus write real server IDs to @AutoId fie
 2. Transitions every tracked object's `state` to `Unchanged` and resets `dirtyCounter`.
 3. Appends the state change into the existing last undo operation — so undo atomically reverts both the user's edits and the committed state together (no spurious extra undo steps).
 
-**Manual composing**
+**Sessions**
 
 ```typescript
-tracker.startComposing();    // begin grouping subsequent changes
-tracker.endComposing();      // commit — all changes become one undo step
-tracker.rollbackComposing(); // revert — all changes since startComposing are rolled back
+const session = tracker.startSession();    // begin a session
+const session = tracker.startSession([…]); // same, with a property scope
+session.end();                             // commit — all changes become one undo step
+session.rollback();                        // revert — all changes since startSession
 ```
 
 **Object construction**

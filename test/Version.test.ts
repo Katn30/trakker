@@ -211,7 +211,7 @@ describe("Tracker.versionChanged", () => {
   });
 });
 
-describe("Tracker.version with rollbackComposing", () => {
+describe("Tracker.version with session.rollback()", () => {
   let tracker: Tracker;
   let person: PersonModel;
 
@@ -221,44 +221,44 @@ describe("Tracker.version with rollbackComposing", () => {
   });
 
   it("decrements by the number of operations rolled back", () => {
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.name = "Alice";
     person.age = 30;
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(tracker.version).toBe(0);
   });
 
   it("fires versionChanged once after rollback when operations were rolled back", () => {
-    tracker.startComposing();
+    const session = tracker.startSession();
     person.name = "Alice";
     person.age = 30;
 
     const handler = vi.fn();
     tracker.versionChanged.subscribe(handler);
 
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(handler).toHaveBeenCalledTimes(1);
     expect(handler).toHaveBeenCalledWith(0);
   });
 
   it("does not fire versionChanged when rollback has nothing to revert", () => {
-    tracker.startComposing();
+    const session = tracker.startSession();
 
     const handler = vi.fn();
     tracker.versionChanged.subscribe(handler);
 
-    tracker.rollbackComposing();
+    session.rollback();
 
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it("version is unaffected by endComposing — increments already happened per operation", () => {
-    tracker.startComposing();
+  it("version is unaffected by session.end() — increments already happened per operation", () => {
+    const session = tracker.startSession();
     person.name = "Alice";
     person.age = 30;
-    tracker.endComposing();
+    session.end();
 
     // Two operations were pushed (+2), merging them into one doesn't adjust version
     expect(tracker.version).toBe(2);
