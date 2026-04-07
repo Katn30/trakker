@@ -8,28 +8,25 @@ import {
 // ---- Mock StateTarget ----
 
 class MockTarget implements StateTarget {
-  idPlaceholder: number | null = null;
+  trackingId: number = 1;
   id: number = 0; // simulates an @AutoId field
 
   state: State = State.Unchanged;
   private _dirtyCounter: number = 0;
-  private _placeholderSeed = -1;
 
   _setState(s: State): void { this.state = s; }
   _getDirtyCounter(): number { return this._dirtyCounter; }
   _setDirtyCounter(v: number): void { this._dirtyCounter = v; }
-
-  readonly tracker = { _nextPlaceholder: () => this._placeholderSeed-- };
 }
 
 function makeTarget(
   state: State,
-  opts: { dirtyCounter?: number; idPlaceholder?: number | null; id?: number } = {},
+  opts: { dirtyCounter?: number; trackingId?: number; id?: number } = {},
 ): MockTarget {
   const t = new MockTarget();
   t._setState(state);
   t._setDirtyCounter(opts.dirtyCounter ?? 0);
-  t.idPlaceholder = opts.idPlaceholder ?? null;
+  t.trackingId = opts.trackingId ?? 1;
   t.id = opts.id ?? 0;
   return t;
 }
@@ -43,34 +40,24 @@ describe("applyStateTransition — added / do", () => {
     expect(obj.state).toBe(State.Insert);
   });
 
-  it("assigns a negative placeholder", () => {
-    const obj = makeTarget(State.Unchanged);
+  it("trackingId is stable across undo/redo cycles", () => {
+    const obj = makeTarget(State.Unchanged, { trackingId: 7 });
     applyStateTransition(obj, 'added', 'do');
-    expect(obj.idPlaceholder).toBeLessThan(0);
-  });
-
-  it("each call assigns a distinct placeholder (redo always gets a fresh one)", () => {
-    const obj = makeTarget(State.Unchanged);
-    applyStateTransition(obj, 'added', 'do');
-    const first = obj.idPlaceholder;
+    expect(obj.trackingId).toBe(7);
 
     applyStateTransition(obj, 'added', 'undo');
-    applyStateTransition(obj, 'added', 'do'); // simulates redo
-    expect(obj.idPlaceholder).not.toBe(first);
+    expect(obj.trackingId).toBe(7);
+
+    applyStateTransition(obj, 'added', 'do'); // redo
+    expect(obj.trackingId).toBe(7);
   });
 });
 
 describe("applyStateTransition — added / undo", () => {
   it("transitions Insert → Unchanged", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
+    const obj = makeTarget(State.Insert, { trackingId: 1 });
     applyStateTransition(obj, 'added', 'undo');
     expect(obj.state).toBe(State.Unchanged);
-  });
-
-  it("clears idPlaceholder", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
-    applyStateTransition(obj, 'added', 'undo');
-    expect(obj.idPlaceholder).toBeNull();
   });
 });
 
@@ -78,19 +65,13 @@ describe("applyStateTransition — added / undo", () => {
 
 describe("applyStateTransition — removed / do — from Insert", () => {
   it("collapses Insert → Unchanged", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
+    const obj = makeTarget(State.Insert, { trackingId: 1 });
     applyStateTransition(obj, 'removed', 'do');
     expect(obj.state).toBe(State.Unchanged);
   });
 
-  it("clears idPlaceholder", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
-    applyStateTransition(obj, 'removed', 'do');
-    expect(obj.idPlaceholder).toBeNull();
-  });
-
   it("resets dirtyCounter to 0", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1, dirtyCounter: 2 });
+    const obj = makeTarget(State.Insert, { trackingId: 1, dirtyCounter: 2 });
     applyStateTransition(obj, 'removed', 'do');
     expect(obj._getDirtyCounter()).toBe(0);
   });
@@ -103,12 +84,6 @@ describe("applyStateTransition — removed / do — from Unchanged", () => {
     expect(obj.state).toBe(State.Deleted);
   });
 
-  it("does not touch idPlaceholder", () => {
-    const obj = makeTarget(State.Unchanged);
-    applyStateTransition(obj, 'removed', 'do');
-    expect(obj.idPlaceholder).toBeNull();
-  });
-
   it("does not touch dirtyCounter", () => {
     const obj = makeTarget(State.Unchanged, { dirtyCounter: 3 });
     applyStateTransition(obj, 'removed', 'do');
@@ -118,15 +93,9 @@ describe("applyStateTransition — removed / do — from Unchanged", () => {
 
 describe("applyStateTransition — removed / undo — prevState Insert", () => {
   it("transitions to Insert", () => {
-    const obj = makeTarget(State.Unchanged); // after a collapsed Insert→Unchanged
-    applyStateTransition(obj, 'removed', 'undo', { prevState: State.Insert });
-    expect(obj.state).toBe(State.Insert);
-  });
-
-  it("assigns a fresh placeholder", () => {
     const obj = makeTarget(State.Unchanged);
     applyStateTransition(obj, 'removed', 'undo', { prevState: State.Insert });
-    expect(obj.idPlaceholder).toBeLessThan(0);
+    expect(obj.state).toBe(State.Insert);
   });
 
   it("restores dirtyCounter from context", () => {
@@ -142,37 +111,25 @@ describe("applyStateTransition — removed / undo — prevState Unchanged", () =
     applyStateTransition(obj, 'removed', 'undo', { prevState: State.Unchanged });
     expect(obj.state).toBe(State.Unchanged);
   });
-
-  it("idPlaceholder stays null", () => {
-    const obj = makeTarget(State.Deleted);
-    applyStateTransition(obj, 'removed', 'undo', { prevState: State.Unchanged });
-    expect(obj.idPlaceholder).toBeNull();
-  });
 });
 
 // ---- committed ----
 
 describe("applyStateTransition — committed / do — Insert with realId", () => {
   it("transitions Insert → Unchanged", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
+    const obj = makeTarget(State.Insert, { trackingId: 1 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert, autoIdProp: 'id', realId: 42 });
     expect(obj.state).toBe(State.Unchanged);
   });
 
   it("writes realId to the @AutoId field", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
+    const obj = makeTarget(State.Insert, { trackingId: 1 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert, autoIdProp: 'id', realId: 42 });
     expect(obj.id).toBe(42);
   });
 
-  it("clears idPlaceholder", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
-    applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert, autoIdProp: 'id', realId: 42 });
-    expect(obj.idPlaceholder).toBeNull();
-  });
-
   it("resets dirtyCounter", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1, dirtyCounter: 3 });
+    const obj = makeTarget(State.Insert, { trackingId: 1, dirtyCounter: 3 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert, autoIdProp: 'id', realId: 42 });
     expect(obj._getDirtyCounter()).toBe(0);
   });
@@ -180,21 +137,41 @@ describe("applyStateTransition — committed / do — Insert with realId", () =>
 
 describe("applyStateTransition — committed / do — Insert without realId", () => {
   it("transitions Insert → Unchanged", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
+    const obj = makeTarget(State.Insert, { trackingId: 1 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert });
     expect(obj.state).toBe(State.Unchanged);
   });
 
   it("does not touch @AutoId field when no realId is provided", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1, id: 0 });
+    const obj = makeTarget(State.Insert, { trackingId: 1, id: 0 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert });
     expect(obj.id).toBe(0);
   });
+});
 
-  it("clears idPlaceholder", () => {
-    const obj = makeTarget(State.Insert, { idPlaceholder: -1 });
-    applyStateTransition(obj, 'committed', 'do', { prevState: State.Insert });
-    expect(obj.idPlaceholder).toBeNull();
+describe("applyStateTransition — committed / do — Changed with realId", () => {
+  it("transitions Changed → Unchanged", () => {
+    const obj = makeTarget(State.Changed, { trackingId: 3, id: 10 });
+    applyStateTransition(obj, 'committed', 'do', { prevState: State.Changed, autoIdProp: 'id', realId: 99 });
+    expect(obj.state).toBe(State.Unchanged);
+  });
+
+  it("writes new realId to the @AutoId field (temporal update: old row closed, new row inserted)", () => {
+    const obj = makeTarget(State.Changed, { trackingId: 3, id: 10 });
+    applyStateTransition(obj, 'committed', 'do', { prevState: State.Changed, autoIdProp: 'id', realId: 99 });
+    expect(obj.id).toBe(99);
+  });
+
+  it("resets dirtyCounter", () => {
+    const obj = makeTarget(State.Changed, { trackingId: 3, dirtyCounter: 2 });
+    applyStateTransition(obj, 'committed', 'do', { prevState: State.Changed, autoIdProp: 'id', realId: 99 });
+    expect(obj._getDirtyCounter()).toBe(0);
+  });
+
+  it("does not touch @AutoId when no realId provided (non-temporal update)", () => {
+    const obj = makeTarget(State.Changed, { trackingId: 3, id: 10 });
+    applyStateTransition(obj, 'committed', 'do', { prevState: State.Changed });
+    expect(obj.id).toBe(10);
   });
 });
 
@@ -218,7 +195,7 @@ describe("applyStateTransition — committed / do — Deleted", () => {
   });
 });
 
-describe("applyStateTransition — committed / do — Unchanged (Changed)", () => {
+describe("applyStateTransition — committed / do — Unchanged", () => {
   it("state remains Unchanged", () => {
     const obj = makeTarget(State.Unchanged, { dirtyCounter: 2 });
     applyStateTransition(obj, 'committed', 'do', { prevState: State.Unchanged });
@@ -244,12 +221,6 @@ describe("applyStateTransition — committed / undo — prevState Insert", () =>
     applyStateTransition(obj, 'committed', 'undo', { prevState: State.Insert });
     expect(obj.id).toBe(42);
   });
-
-  it("idPlaceholder stays null", () => {
-    const obj = makeTarget(State.Unchanged, { id: 42 });
-    applyStateTransition(obj, 'committed', 'undo', { prevState: State.Insert });
-    expect(obj.idPlaceholder).toBeNull();
-  });
 });
 
 describe("applyStateTransition — committed / undo — prevState Deleted", () => {
@@ -259,10 +230,10 @@ describe("applyStateTransition — committed / undo — prevState Deleted", () =
     expect(obj.state).toBe(State.Insert);
   });
 
-  it("assigns a fresh placeholder", () => {
-    const obj = makeTarget(State.Unchanged);
+  it("trackingId remains stable", () => {
+    const obj = makeTarget(State.Unchanged, { trackingId: 5 });
     applyStateTransition(obj, 'committed', 'undo', { prevState: State.Deleted });
-    expect(obj.idPlaceholder).toBeLessThan(0);
+    expect(obj.trackingId).toBe(5);
   });
 });
 
@@ -272,12 +243,6 @@ describe("applyStateTransition — committed / undo — prevState Unchanged", ()
     applyStateTransition(obj, 'committed', 'undo', { prevState: State.Unchanged });
     expect(obj.state).toBe(State.Unchanged);
   });
-
-  it("does not touch idPlaceholder", () => {
-    const obj = makeTarget(State.Unchanged);
-    applyStateTransition(obj, 'committed', 'undo', { prevState: State.Unchanged });
-    expect(obj.idPlaceholder).toBeNull();
-  });
 });
 
 describe("applyStateTransition — committed / undo — prevState Changed", () => {
@@ -285,11 +250,5 @@ describe("applyStateTransition — committed / undo — prevState Changed", () =
     const obj = makeTarget(State.Unchanged);
     applyStateTransition(obj, 'committed', 'undo', { prevState: State.Changed });
     expect(obj.state).toBe(State.Changed);
-  });
-
-  it("does not touch idPlaceholder", () => {
-    const obj = makeTarget(State.Unchanged);
-    applyStateTransition(obj, 'committed', 'undo', { prevState: State.Changed });
-    expect(obj.idPlaceholder).toBeNull();
   });
 });

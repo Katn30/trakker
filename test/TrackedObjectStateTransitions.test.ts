@@ -5,13 +5,15 @@
  * undo, redo, commit) and verifies both the resulting State and that
  * the save layer can determine the correct server operation and ID:
  *
- *   obj.state          → which operation (Insert/Changed/Deleted/Unchanged)
- *   obj.idPlaceholder  → temp ID to use for Insert items (POST)
- *   obj.id             → real server ID to use for Changed/Deleted items (PUT/DELETE)
+ *   obj.state        → which operation (Insert/Changed/Deleted/Unchanged)
+ *   obj.trackingId   → client-assigned stable ID, used in the save payload for
+ *                      Insert and Changed items so the backend can echo back
+ *                      the new server-assigned PK
+ *   obj.id           → real server ID (for Changed/Deleted items)
  *
  * Key invariants:
- *   Insert    → POST  using idPlaceholder  (obj.id may hold a stale real server id)
- *   Changed   → PUT   using obj.id         (always a real server id > 0)
+ *   Insert    → POST   sending trackingId  (obj.id may hold a stale real server id)
+ *   Changed   → PATCH  sending trackingId + obj.id  (backend returns new PK for temporal tables)
  *   Deleted   → DELETE using obj.id        (always a real server id > 0)
  *   Unchanged → skip
  */
@@ -46,18 +48,17 @@ function loadedItem(tracker: Tracker, realId: number): ItemModel {
 // ---- Insert ----
 
 describe("TrackedObject state transitions — Insert", () => {
-  it("new item added to collection: state=Insert, idPlaceholder<0", () => {
+  it("new item added to collection: state=Insert, trackingId assigned at construction", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
 
     expect(item.state).toBe(State.Insert);
-    expect(item.idPlaceholder).not.toBeNull();
-    expect(item.idPlaceholder).toBeLessThan(0);
+    expect(item.trackingId).toBeGreaterThan(0);
   });
 
-  it("Insert: save layer should use idPlaceholder, not the @AutoId field", () => {
+  it("Insert: save layer should use trackingId for payload, @AutoId is untouched", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
@@ -65,50 +66,45 @@ describe("TrackedObject state transitions — Insert", () => {
 
     expect(item.state).toBe(State.Insert);
     expect(item.id).toBe(0); // untouched by the library
-    expect(item.idPlaceholder).toBeLessThan(0);
+    expect(item.trackingId).toBeGreaterThan(0);
   });
 
-  it("undo push → state=Unchanged, idPlaceholder=null → skip", () => {
+  it("undo push → state=Unchanged, trackingId unchanged → skip", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
+    const tid = item.trackingId;
     items.push(item);
     tracker.undo();
 
     expect(item.state).toBe(State.Unchanged);
-    expect(item.idPlaceholder).toBeNull();
+    expect(item.trackingId).toBe(tid); // trackingId is stable
   });
 
-  it("undo push → redo push → state=Insert, fresh idPlaceholder<0 → POST", () => {
+  it("undo push → redo push → state=Insert, same trackingId → POST", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
+    const tid = item.trackingId;
     items.push(item);
-    const firstPh = item.idPlaceholder!;
 
     tracker.undo();
     tracker.redo();
 
     expect(item.state).toBe(State.Insert);
-    expect(item.idPlaceholder).toBeLessThan(0);
-    expect(item.idPlaceholder).not.toBe(firstPh); // fresh placeholder on redo
+    expect(item.trackingId).toBe(tid); // stable across undo/redo
   });
 
-  it("undo before commit clears idPlaceholder; redo assigns a fresh one usable for commit", () => {
+  it("trackingId usable after undo+redo cycle for onCommit", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    const firstPlaceholder = item.idPlaceholder!;
 
     tracker.undo();
-    expect(item.idPlaceholder).toBeNull();
-
     tracker.redo();
-    expect(item.idPlaceholder).not.toBeNull();
-    expect(item.idPlaceholder).not.toBe(firstPlaceholder);
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(1);
   });
@@ -119,7 +115,7 @@ describe("TrackedObject state transitions — Insert", () => {
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
 
     tracker.undo();
     expect(item.state).toBe(State.Deleted);
@@ -136,14 +132,14 @@ describe("TrackedObject state transitions — Insert", () => {
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    item.name = "Widget"; // two user operations total
+    item.name = "Widget";
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
 
-    tracker.undo(); // undoes name + committed state → Deleted
+    tracker.undo();
     expect(item.state).toBe(State.Deleted);
 
-    tracker.undo(); // undoes push → state=Unchanged (added/undo), dirtyCounter=-1 but no longer drives state
+    tracker.undo();
     expect(item.state).toBe(State.Unchanged);
     expect(tracker.canUndo).toBe(false);
   });
@@ -152,9 +148,9 @@ describe("TrackedObject state transitions — Insert", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
-    items.push(item); // single user operation
+    items.push(item);
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
 
     tracker.undo();
     expect(tracker.canUndo).toBe(false);
@@ -165,57 +161,53 @@ describe("TrackedObject state transitions — Insert", () => {
 // ---- Committed Insert undone ----
 
 describe("TrackedObject state transitions — committed Insert undone", () => {
-  it("push → commit(id=1) → state=Unchanged → skip", () => {
+  it("push → commit(id=1) → state=Unchanged", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(1);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("push → commit(id=1) → undo: state=Deleted, id=1, idPlaceholder=null → DELETE with id=1", () => {
+  it("push → commit(id=1) → undo: state=Deleted, id=1 → DELETE with id=1", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
     tracker.undo();
 
     expect(item.state).toBe(State.Deleted);
-    expect(item.id).toBe(1); // real id — use for DELETE
-    expect(item.idPlaceholder).toBeNull();
+    expect(item.id).toBe(1);
   });
 
-  it("push → commit(id=1) → undo → redo: state=Unchanged → skip", () => {
+  it("push → commit(id=1) → undo → redo: state=Unchanged", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 1 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 1 }]);
     tracker.undo();
     tracker.redo();
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(1);
-    expect(item.idPlaceholder).toBeNull();
   });
 });
 
 // ---- Changed ----
 
 describe("TrackedObject state transitions — Changed", () => {
-  it("loaded item edited: state=Changed, id=real, idPlaceholder=null → PUT with id", () => {
+  it("loaded item edited: state=Changed, id=real → PATCH with id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     item.name = "Widget";
 
     expect(item.state).toBe(State.Changed);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
   it("edit → undo → state=Unchanged → skip", () => {
@@ -226,10 +218,9 @@ describe("TrackedObject state transitions — Changed", () => {
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("edit → undo → redo → state=Changed, id=10, idPlaceholder=null → PUT with id", () => {
+  it("edit → undo → redo → state=Changed, id=10 → PATCH with id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     item.name = "Widget";
@@ -238,7 +229,6 @@ describe("TrackedObject state transitions — Changed", () => {
 
     expect(item.state).toBe(State.Changed);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
   it("undo before commit discards change; redo restores it and commit succeeds", () => {
@@ -258,7 +248,7 @@ describe("TrackedObject state transitions — Changed", () => {
     expect(item.state).toBe(State.Unchanged);
   });
 
-  it("edit → commit → state=Unchanged → skip", () => {
+  it("edit → commit (non-temporal, no keys) → state=Unchanged, id unchanged", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     item.name = "Widget";
@@ -266,10 +256,21 @@ describe("TrackedObject state transitions — Changed", () => {
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("edit → commit → undo → state=Changed, id=10, pre-edit values restored → PUT with id", () => {
+  it("edit → commit (temporal: returns new PK) → @AutoId updated to new PK", () => {
+    const tracker = new Tracker();
+    const item = loadedItem(tracker, 10);
+    const tid = item.trackingId;
+    item.name = "Widget";
+
+    tracker.onCommit([{ trackingId: tid, value: 99 }]);
+
+    expect(item.state).toBe(State.Unchanged);
+    expect(item.id).toBe(99); // new server PK after soft-delete + insert
+  });
+
+  it("edit → commit → undo → state=Changed, id=10, pre-edit values restored", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     item.name = "Widget";
@@ -277,12 +278,11 @@ describe("TrackedObject state transitions — Changed", () => {
     tracker.undo();
 
     expect(item.state).toBe(State.Changed);
-    expect(item.name).toBe(""); // pre-edit value restored
+    expect(item.name).toBe("");
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("edit → commit → undo → redo → state=Unchanged → skip", () => {
+  it("edit → commit → undo → redo → state=Unchanged", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     item.name = "Widget";
@@ -293,14 +293,13 @@ describe("TrackedObject state transitions — Changed", () => {
     expect(item.state).toBe(State.Unchanged);
     expect(item.name).toBe("Widget");
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 });
 
 // ---- Deleted ----
 
 describe("TrackedObject state transitions — Deleted", () => {
-  it("loaded item removed: state=Deleted, id=real, idPlaceholder=null → DELETE with id", () => {
+  it("loaded item removed: state=Deleted, id=real → DELETE with id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -308,7 +307,6 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     expect(item.state).toBe(State.Deleted);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
   it("remove → undo → state=Unchanged → skip", () => {
@@ -320,10 +318,9 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("remove → undo → redo → state=Deleted, id=10, idPlaceholder=null → DELETE with id", () => {
+  it("remove → undo → redo → state=Deleted, id=10 → DELETE with id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -333,7 +330,6 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     expect(item.state).toBe(State.Deleted);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
   it("undo before commit clears Deleted; redo restores it and commit succeeds", () => {
@@ -352,7 +348,7 @@ describe("TrackedObject state transitions — Deleted", () => {
     expect(item.state).toBe(State.Unchanged);
   });
 
-  it("remove → commit → state=Unchanged → skip", () => {
+  it("remove → commit → state=Unchanged", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -361,10 +357,9 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 
-  it("remove → commit → undo: state=Insert, idPlaceholder<0 — save layer must POST using idPlaceholder, NOT the stale id", () => {
+  it("remove → commit → undo: state=Insert, id=10 stale — save layer must POST using trackingId, NOT the stale id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -372,15 +367,12 @@ describe("TrackedObject state transitions — Deleted", () => {
     tracker.onCommit();
     tracker.undo();
 
-    // Critical: @AutoId still holds real server id (10), but the item needs
-    // a new INSERT. The save layer MUST use idPlaceholder, not item.id.
     expect(item.state).toBe(State.Insert);
-    expect(item.idPlaceholder).not.toBeNull();
-    expect(item.idPlaceholder).toBeLessThan(0);
+    expect(item.trackingId).toBeGreaterThan(0);
     expect(item.id).toBe(10); // stale — do NOT use for INSERT
   });
 
-  it("committed delete → undo (Insert with fresh placeholder) → commit again re-inserts the item", () => {
+  it("committed delete → undo (Insert) → commit again re-inserts the item", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -390,14 +382,13 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     tracker.undo();
     expect(item.state).toBe(State.Insert);
-    expect(item.idPlaceholder).toBeLessThan(0);
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 99 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 99 }]);
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(99);
   });
 
-  it("remove → commit → undo → redo → state=Unchanged → skip", () => {
+  it("remove → commit → undo → redo → state=Unchanged", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 10);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -408,7 +399,6 @@ describe("TrackedObject state transitions — Deleted", () => {
 
     expect(item.state).toBe(State.Unchanged);
     expect(item.id).toBe(10);
-    expect(item.idPlaceholder).toBeNull();
   });
 });
 
@@ -423,31 +413,26 @@ describe("TrackedObject state transitions — Insert collapsed by remove", () =>
     items.remove(item);
 
     expect(item.state).toBe(State.Unchanged);
-    expect(item.idPlaceholder).toBeNull();
   });
 });
 
-// ---- @AutoId / idPlaceholder ----
+// ---- @AutoId / trackingId ----
 
-describe("TrackedObject state transitions — @AutoId / idPlaceholder", () => {
-  it("assigns distinct placeholders to multiple new items", () => {
+describe("TrackedObject state transitions — @AutoId / trackingId", () => {
+  it("every object gets a unique trackingId at construction", () => {
     const tracker = new Tracker();
-    const items = new TrackedCollection<ItemModel>(tracker);
     const i1 = tracker.construct(() => new ItemModel(tracker));
     const i2 = tracker.construct(() => new ItemModel(tracker));
-    items.push(i1);
-    items.push(i2);
 
-    expect(i1.idPlaceholder).not.toBeNull();
-    expect(i2.idPlaceholder).not.toBeNull();
-    expect(i1.idPlaceholder).not.toBe(i2.idPlaceholder);
+    expect(i1.trackingId).not.toBe(i2.trackingId);
   });
 
-  it("item with an existing positive id has no placeholder", () => {
+  it("trackingId is positive and assigned regardless of state", () => {
     const tracker = new Tracker();
-    const item = loadedItem(tracker, 42);
+    const item = tracker.construct(() => new ItemModel(tracker));
 
-    expect(item.idPlaceholder).toBeNull();
+    expect(item.trackingId).toBeGreaterThan(0);
+    expect(item.state).toBe(State.Unchanged); // not yet pushed
   });
 
   it("onCommit marks tracker as not dirty", () => {
@@ -461,31 +446,30 @@ describe("TrackedObject state transitions — @AutoId / idPlaceholder", () => {
     expect(tracker.isDirty).toBe(false);
   });
 
-  it("leaves @AutoId unchanged when placeholder not found in keys", () => {
+  it("leaves @AutoId unchanged when trackingId not found in keys", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
     items.push(item);
-    tracker.onCommit([{ placeholder: -999, value: 101 }]);
+    tracker.onCommit([{ trackingId: 9999, value: 101 }]);
 
     expect(item.id).toBe(0); // not matched → unchanged
-    expect(item.idPlaceholder).toBeNull(); // still cleared by state machine
+    expect(item.state).toBe(State.Unchanged); // still committed
   });
 
-  it("idPlaceholder is globally unique across save cycles", () => {
+  it("trackingId is globally unique across save cycles", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const i1 = tracker.construct(() => new ItemModel(tracker));
     items.push(i1);
-    const ph1 = i1.idPlaceholder!;
-    tracker.onCommit([{ placeholder: ph1, value: 1 }]);
+    const tid1 = i1.trackingId;
+    tracker.onCommit([{ trackingId: tid1, value: 1 }]);
 
     const i2 = tracker.construct(() => new ItemModel(tracker));
     items.push(i2);
 
-    expect(i2.idPlaceholder).not.toBeNull();
-    expect(i2.idPlaceholder).toBeLessThan(0);
-    expect(i2.idPlaceholder).not.toBe(ph1);
+    expect(i2.trackingId).toBeGreaterThan(0);
+    expect(i2.trackingId).not.toBe(tid1);
   });
 
   it("@AutoId field is never written with a non-server value by the library", () => {
@@ -494,15 +478,15 @@ describe("TrackedObject state transitions — @AutoId / idPlaceholder", () => {
     const item = tracker.construct(() => new ItemModel(tracker));
 
     items.push(item);
-    expect(item.id).toBe(0); // placeholder assigned but @AutoId untouched
+    expect(item.id).toBe(0);
 
     tracker.undo();
-    expect(item.id).toBe(0); // @AutoId still untouched
+    expect(item.id).toBe(0);
 
     tracker.redo();
-    expect(item.id).toBe(0); // @AutoId still untouched
+    expect(item.id).toBe(0);
 
-    tracker.onCommit([{ placeholder: item.idPlaceholder!, value: 42 }]);
+    tracker.onCommit([{ trackingId: item.trackingId, value: 42 }]);
     expect(item.id).toBe(42); // only now does the library write to @AutoId
 
     tracker.undo();
@@ -515,17 +499,18 @@ describe("TrackedObject state transitions — @AutoId / idPlaceholder", () => {
 describe("TrackedObject state transitions — save operation routing", () => {
   /**
    * Mirrors the save loop a frontend would run over tracker.trackedObjects.
+   * For temporal tables, Changed items also produce a new server PK.
    */
-  function whatToSave(item: ItemModel): { op: string; idToUse: number | null } {
+  function whatToSave(item: ItemModel): { op: string; idToUse: number } {
     switch (item.state) {
-      case State.Insert:   return { op: "POST",   idToUse: item.idPlaceholder };
-      case State.Changed:  return { op: "PUT",    idToUse: item.id };
+      case State.Insert:   return { op: "POST",   idToUse: item.trackingId };
+      case State.Changed:  return { op: "PATCH",  idToUse: item.id };
       case State.Deleted:  return { op: "DELETE", idToUse: item.id };
-      default:                 return { op: "skip",   idToUse: null };
+      default:             return { op: "skip",   idToUse: 0 };
     }
   }
 
-  it("new item → POST using idPlaceholder", () => {
+  it("new item → POST using trackingId", () => {
     const tracker = new Tracker();
     const items = new TrackedCollection<ItemModel>(tracker);
     const item = tracker.construct(() => new ItemModel(tracker));
@@ -533,17 +518,16 @@ describe("TrackedObject state transitions — save operation routing", () => {
 
     const { op, idToUse } = whatToSave(item);
     expect(op).toBe("POST");
-    expect(idToUse).toBeLessThan(0);
-    expect(idToUse).toBe(item.idPlaceholder);
+    expect(idToUse).toBe(item.trackingId);
   });
 
-  it("loaded + edited → PUT using real id", () => {
+  it("loaded + edited → PATCH using real id", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 5);
     item.name = "Updated";
 
     const { op, idToUse } = whatToSave(item);
-    expect(op).toBe("PUT");
+    expect(op).toBe("PATCH");
     expect(idToUse).toBe(5);
   });
 
@@ -558,7 +542,7 @@ describe("TrackedObject state transitions — save operation routing", () => {
     expect(idToUse).toBe(5);
   });
 
-  it("committed delete → undo → POST using fresh idPlaceholder (NOT stale real id)", () => {
+  it("committed delete → undo → POST using trackingId (NOT stale real id)", () => {
     const tracker = new Tracker();
     const item = loadedItem(tracker, 99);
     const coll = new TrackedCollection<ItemModel>(tracker, [item]);
@@ -568,8 +552,8 @@ describe("TrackedObject state transitions — save operation routing", () => {
 
     const { op, idToUse } = whatToSave(item);
     expect(op).toBe("POST");
-    expect(idToUse).toBeLessThan(0); // fresh placeholder, never the stale 99
-    expect(idToUse).not.toBe(99);
+    expect(idToUse).toBe(item.trackingId);
+    expect(idToUse).not.toBe(99); // never the stale real id
   });
 
   it("loaded item → skip (no operation needed)", () => {

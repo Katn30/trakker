@@ -1,5 +1,5 @@
 export interface IdAssignment {
-  placeholder: number;
+  trackingId: number;
   value: number;
 }
 

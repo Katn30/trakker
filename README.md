@@ -55,7 +55,7 @@ class InvoiceModel extends TrackedObject {
 
 const invoices = new TrackedCollection<InvoiceModel>(tracker);
 const invoice = tracker.construct(() => new InvoiceModel(tracker));
-invoices.push(invoice);        // state: Insert, idPlaceholder: -1
+invoices.push(invoice);        // state: Insert, trackingId: 1
 
 invoice.status = 'draft';     // recorded
 invoice.total = 100;          // recorded
@@ -489,38 +489,38 @@ Every `TrackedObject` has a `state: State` property — the single source of tru
 
 #### Redo is always the same as do
 
-There is no separate redo transition. Redo simply re-runs the original `do` action. This means `added/do` and `added/redo` are identical — both assign a **fresh** `idPlaceholder`. Placeholders from a previous do/undo cycle are never reused.
+There is no separate redo transition. Redo simply re-runs the original `do` action. `trackingId` is assigned at construction and never changes, so it is always available regardless of undo/redo cycles.
 
 #### Full transition table
 
-| Event | Direction | From | To | `idPlaceholder` | `@AutoId` field |
-|---|---|---|---|---|---|
-| edit | do / redo | Unchanged | **Changed** | null | untouched |
-| edit | do / redo | Changed | Changed | null | untouched |
-| edit | undo (last edit) | Changed | **Unchanged** | null | untouched |
-| edit | undo (not last) | Changed | Changed | null | untouched |
-| added | do / redo | Unchanged | **Insert** | new negative | untouched |
-| added | undo | Insert | **Unchanged** | null | untouched |
-| removed | do / redo | Insert | **Unchanged** | null, dirtyCounter reset | untouched |
-| removed | do / redo | Unchanged | **Deleted** | null | untouched |
-| removed | undo | Unchanged (was Insert) | **Insert** | new negative | untouched |
-| removed | undo | Deleted | **Unchanged** | null | untouched |
-| committed | do / redo | Insert | **Unchanged** | null | written with real id |
-| committed | do / redo | Changed | **Unchanged** | null | untouched |
-| committed | do / redo | Deleted | **Unchanged** | null | untouched |
-| committed | undo | was Insert | **Deleted** | null | kept (real id for DELETE) |
-| committed | undo | was Changed | **Changed** | null | untouched |
-| committed | undo | was Deleted | **Insert** | new negative | kept (stale — use `idPlaceholder`) |
+| Event | Direction | From | To | `@AutoId` field |
+|---|---|---|---|---|
+| edit | do / redo | Unchanged | **Changed** | untouched |
+| edit | do / redo | Changed | Changed | untouched |
+| edit | undo (last edit) | Changed | **Unchanged** | untouched |
+| edit | undo (not last) | Changed | Changed | untouched |
+| added | do / redo | Unchanged | **Insert** | untouched |
+| added | undo | Insert | **Unchanged** | untouched |
+| removed | do / redo | Insert | **Unchanged** | untouched, dirtyCounter reset |
+| removed | do / redo | Unchanged | **Deleted** | untouched |
+| removed | undo | Unchanged (was Insert) | **Insert** | untouched |
+| removed | undo | Deleted | **Unchanged** | untouched |
+| committed | do / redo | Insert | **Unchanged** | written with real id (if key supplied) |
+| committed | do / redo | Changed | **Unchanged** | written with real id (if key supplied) |
+| committed | do / redo | Deleted | **Unchanged** | untouched |
+| committed | undo | was Insert | **Deleted** | kept (real id for DELETE) |
+| committed | undo | was Changed | **Changed** | untouched |
+| committed | undo | was Deleted | **Insert** | kept (stale — use `trackingId` for POST) |
 
 #### Key notes
 
-**`removed/do` from `Insert` collapses to `Unchanged`** — if an object was added and then removed before ever being committed, it was never persisted. The transition resets `dirtyCounter` to zero and clears `idPlaceholder` as if the add never happened. Nothing needs to be sent to the server.
+**`removed/do` from `Insert` collapses to `Unchanged`** — if an object was added and then removed before ever being committed, it was never persisted. The transition resets `dirtyCounter` to zero as if the add never happened. Nothing needs to be sent to the server.
 
 **`committed/undo` reverses the server operation** — undoing past a commit puts the object into the state that requires the inverse server operation. Undoing a committed INSERT requires a DELETE; undoing a committed DELETE requires a new INSERT; undoing a committed UPDATE requires another UPDATE with the pre-edit values.
 
-**`@AutoId` is never zeroed out** — when `committed/undo` runs after a committed INSERT, the real server id stays on the `@AutoId` field so the save layer can send `DELETE /resource/{id}`. Similarly, after `committed/undo` of a DELETE, the `@AutoId` field still holds the old real id — but since `state` is now `Insert`, the save layer must use `idPlaceholder` as the POST key, not `@AutoId`.
+**`@AutoId` is never zeroed out** — when `committed/undo` runs after a committed INSERT, the real server id stays on the `@AutoId` field so the save layer can send `DELETE /resource/{id}`. Similarly, after `committed/undo` of a DELETE, the `@AutoId` field still holds the old real id — but since `state` is now `Insert`, the save layer must use `trackingId` to identify the item in the POST payload, not `@AutoId`.
 
-**`idPlaceholder` for `Insert` items** — always use `obj.idPlaceholder` (never `obj.@AutoId`) to identify an `Insert` item in the save payload. After a `committed delete → undo` cycle, `@AutoId` holds a stale real id while `idPlaceholder` holds the correct fresh temp key.
+**`trackingId` for `Insert` and `Changed` items** — `trackingId` is assigned at construction and never changes. Include it in the save payload for `Insert` and `Changed` items so the backend can echo back the new server-assigned PK for each. See [Recommended save pattern](#recommended-save-pattern) and [Temporally versioned tables](#temporally-versioned-tables) for usage.
 
 ### Recommended save pattern
 
@@ -528,7 +528,9 @@ trakr does not mandate a specific save strategy — you can send changes per-obj
 
 That said, a pattern that works well with trakr's design is **all-or-nothing saves**: when the user clicks Save, the frontend collects every dirty object across the tracker, serialises them into a single request, and the backend saves everything inside one transaction — either succeeding fully or returning an error without applying partial changes. The frontend then calls `tracker.onCommit()` only on success.
 
-This pairs naturally with `@AutoId`: `idPlaceholder` values are automatically assigned as negative integers when an object is added to a collection. New objects can reference each other via their `idPlaceholder` in the payload (e.g. a new parent and its new children share consistent temp IDs before the server assigns real ones). After a successful save, `tracker.onCommit(keys)` swaps the placeholders for real server IDs in place — no page reload is needed. This is the intended experience for form-heavy back-office pages, though reloading or restructuring state on save is equally valid.
+Every `TrackedObject` has a `trackingId` — a positive integer assigned at construction time, stable for the lifetime of the object, unique across the tracker. Include `trackingId` in the save payload for `Insert` and `Changed` items. The backend echoes it back alongside the server-assigned PK for any item that produced a new row. `onCommit(keys)` then iterates every entry in `keys`, matches by `trackingId`, and writes the real PK to the `@AutoId` field of any match — regardless of whether the item was `Insert` or `Changed`.
+
+New objects can reference each other via their `trackingId` in the payload (e.g. a new parent and its new children share consistent temp IDs before the server assigns real ones). After a successful save, `tracker.onCommit(keys)` updates all matched objects in place — no page reload is needed. This is the intended experience for form-heavy back-office pages, though reloading or restructuring state on save is equally valid.
 
 **On failure, do not call `onCommit()`.**
 
@@ -577,10 +579,14 @@ Calling `undo()` or `redo()` when the respective flag is `false` is a no-op.
 
 ```typescript
 tracker.onCommit();           // mark current state as committed — isDirty → false
-tracker.onCommit(keys);       // same, plus swap placeholder IDs for real server IDs
+tracker.onCommit(keys);       // same, plus write real server IDs to @AutoId fields
 ```
 
-`onCommit()` automatically transitions every tracked object's `state` to `Unchanged` and appends the state change into the existing last undo operation — so undo atomically reverts both the user's edits and the committed state together (no spurious extra undo steps).
+`onCommit(keys?)` does three things:
+
+1. Iterates every entry in `keys`. For each entry it finds a tracked object whose `trackingId` matches `entry.trackingId` and writes `entry.value` to its `@AutoId` field. This applies to both `Insert` items (new rows) and `Changed` items (e.g. temporal tables where an update produces a new row with a new PK).
+2. Transitions every tracked object's `state` to `Unchanged` and resets `dirtyCounter`.
+3. Appends the state change into the existing last undo operation — so undo atomically reverts both the user's edits and the committed state together (no spurious extra undo steps).
 
 **Manual composing**
 
@@ -675,7 +681,7 @@ const invoice = tracker.construct(() => new InvoiceModel(tracker));
 |---|---|---|
 | `tracker` | `Tracker` | The tracker this model belongs to (set via `super(tracker)`) |
 | `state` | `State` | The current persistence state — `Unchanged`, `Insert`, `Changed`, or `Deleted` |
-| `idPlaceholder` | `number \| null` | Negative temp key assigned automatically when the object is added to a `TrackedCollection`. `null` when state is not `Insert`. Always use this (not the `@AutoId` field) as the POST key for `Insert` items |
+| `trackingId` | `number` | Positive client-assigned identifier, unique across the tracker, set at construction and never changed. Include in the save payload for `Insert` and `Changed` items so the backend can return the new server PK |
 | `isDirty` | `boolean` | `true` when this model has uncommitted property changes |
 | `dirtyCounter` | `number` | Net count of uncommitted property writes. Increments on each write, decrements on undo. Reset to `0` by `onCommit()`. Can be negative after undoing past a committed save |
 | `isValid` | `boolean` | `true` when all `@Tracked()` validators pass |
@@ -790,19 +796,20 @@ tracker.construct(() => {
   new InvoiceModel(tracker, { id: 2, status: 'sent' });
 });
 
-// Create a new invoice and add it to a collection (state → Insert, idPlaceholder auto-assigned)
+// Create a new invoice and add it to a collection (state → Insert)
 const invoices = new TrackedCollection<InvoiceModel>(tracker);
 const newInvoice = tracker.construct(() => new InvoiceModel(tracker));
 invoices.push(newInvoice);
 newInvoice.status = 'pending';
-// newInvoice.idPlaceholder === -1  (auto-assigned negative temp key)
+// newInvoice.trackingId === 3  (assigned at construction, never changes)
+// newInvoice.id         === 0  (untouched by the library until onCommit)
 
 // --- Save ---
 
 // Build the payload by reading each object's state
 const payload: {
-  inserts: { placeholder: number; status: string }[];
-  updates: { id: number; status: string }[];
+  inserts: { trackingId: number; status: string }[];
+  updates: { trackingId: number; id: number; status: string }[];
   deletes: { id: number }[];
 } = { inserts: [], updates: [], deletes: [] };
 
@@ -810,11 +817,11 @@ for (const obj of tracker.trackedObjects) {
   if (!(obj instanceof InvoiceModel)) continue;
   switch (obj.state) {
     case State.Insert:
-      // Use idPlaceholder — NOT obj.id, which may hold a stale real server id
-      payload.inserts.push({ placeholder: obj.idPlaceholder!, status: obj.status });
+      // Send trackingId so the backend can echo back the new server PK
+      payload.inserts.push({ trackingId: obj.trackingId, status: obj.status });
       break;
     case State.Changed:
-      payload.updates.push({ id: obj.id, status: obj.status });
+      payload.updates.push({ trackingId: obj.trackingId, id: obj.id, status: obj.status });
       break;
     case State.Deleted:
       payload.deletes.push({ id: obj.id });
@@ -826,14 +833,14 @@ for (const obj of tracker.trackedObjects) {
 
 // Send to server — backend runs everything in one transaction
 const response = await api.save(payload);
-// response.ids: [{ placeholder: -1, value: 42 }]
+// response.ids: [{ trackingId: 3, value: 42 }]
 
 // Apply real IDs and mark everything clean — no page reload needed
 tracker.onCommit(response.ids);
 // newInvoice.id === 42, state === Unchanged
 // tracker.isDirty === false
 
-// When no new objects were created, keys can be omitted:
+// When no new PKs were assigned, keys can be omitted:
 // tracker.onCommit();
 ```
 
@@ -857,33 +864,32 @@ class InvoiceModel extends TrackedObject {
 }
 ```
 
-When a new object is added to a `TrackedCollection`, a **negative placeholder ID** is automatically assigned to `idPlaceholder` on the `TrackedObject`. The `@AutoId` field itself is left at its initial value until a real server ID arrives. This separation matters: after undo/redo cycles the `@AutoId` field may hold a stale real server ID — the save layer must always use `idPlaceholder` when the state is `Insert`.
+The `@AutoId` field is left at its initial value until `onCommit(keys)` writes the real server ID. The save layer identifies items that need a new PK via `trackingId` — a stable, positive integer assigned at construction and never changed. Include `trackingId` in the save payload for `Insert` (and `Changed`, for temporal tables) items; the backend returns it alongside the new PK.
 
 **Typical save flow:**
 
 ```typescript
 const invoice = tracker.construct(() => new InvoiceModel(tracker));
 invoices.push(invoice);
-// invoice.idPlaceholder === -1  (auto-assigned when pushed)
-// invoice.id            === 0   (untouched by the library)
+// invoice.trackingId === 1  (assigned at construction, never changes)
+// invoice.id         === 0  (untouched by the library)
 
 invoice.status = 'draft';
 
-// 1. Build payload — use idPlaceholder for Insert items:
-const serverIds = [{ placeholder: invoice.idPlaceholder!, value: 42 }];
+// 1. Build payload — send trackingId for Insert items:
+const serverIds = [{ trackingId: invoice.trackingId, value: 42 }];
 
 // 2. Send to server, receive real IDs back.
 
 // 3. Apply real IDs and mark clean:
 tracker.onCommit(serverIds);
-// invoice.id            === 42  (written by onCommit)
-// invoice.idPlaceholder === null
-// tracker.isDirty       === false
+// invoice.id        === 42  (written by onCommit)
+// tracker.isDirty   === false
 ```
 
 `onCommit()` with no arguments (or an empty array) still marks the tracker as clean — it just skips the ID replacement step.
 
-The placeholder counter never resets — each cycle continues from where it left off — so `idPlaceholder` values are globally unique across the lifetime of the tracker and can never collide across save cycles.
+`trackingId` values are globally unique across the lifetime of the tracker and never reused, so they can safely serve as correlation keys across multiple save cycles.
 
 ---
 
@@ -915,15 +921,15 @@ The shape of each entry in the `keys` array passed to `tracker.onCommit(keys)`:
 
 ```typescript
 import type { IdAssignment } from '@katn30/trakr';
-// { placeholder: number; value: number }
+// { trackingId: number; value: number }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `placeholder` | `number` | The negative `idPlaceholder` value that was active at save time |
-| `value` | `number` | The real server-assigned ID to substitute in |
+| `trackingId` | `number` | The `trackingId` of the object that received a new server-assigned PK |
+| `value` | `number` | The real server-assigned ID to write to the `@AutoId` field |
 
-The server returns one `IdAssignment` per inserted object. `onCommit()` matches each entry against the `idPlaceholder` of every tracked object and writes `value` to the `@AutoId` field of any match.
+The server returns one `IdAssignment` per item that produced a new database row — both inserted objects and, in temporal tables, updated objects (see [Temporally versioned tables](#temporally-versioned-tables)). `onCommit()` iterates every entry, matches by `trackingId` against every tracked object, and writes `value` to the `@AutoId` field of any match.
 
 ---
 
@@ -1200,6 +1206,122 @@ event.emit('world');  // → (nothing)
 | `subscribe(handler)` | `() => void` | Registers a listener. Returns an unsubscriber |
 | `unsubscribe(handler)` | `void` | Removes a specific listener |
 | `emit(value)` | `void` | Calls all registered listeners with the given value |
+
+---
+
+## Temporally versioned tables
+
+Some databases never modify or delete rows in place. Instead, each row carries a validity period — typically `dt_start_validity` and `dt_end_validity` columns. An "update" means closing the current row (`dt_end_validity = now()`) and inserting a new row with `dt_end_validity = null`. A "delete" means closing the current row the same way. This is called **Method 2 temporal versioning**.
+
+Because every update produces a new database row with a new auto-increment PK, the `@AutoId` field on a `Changed` object becomes stale after a successful save: the old row it pointed to has been closed, and the new row carries a different PK. The model must be updated with the new PK before the next save, otherwise the save layer would try to close the wrong row.
+
+trakr handles this through `trackingId` and `onCommit`. The save flow for temporal tables is the same as the standard flow — the only difference is that the backend also returns `{ trackingId, value }` entries for `Changed` items (not just `Insert` items), and `onCommit(keys)` writes the new PK to those objects too.
+
+### The problem
+
+In a standard (non-temporal) database, an UPDATE modifies a row in place. The PK stays the same. After commit, `obj.id` is still correct.
+
+In a temporal database, an UPDATE closes the current row and inserts a new one. The new row has a fresh PK. After commit, `obj.id` points to the closed row — it is now stale.
+
+```
+Before save:   obj.id = 10   (current, open row)
+Backend:       closes row 10, inserts row 99
+After save:    obj.id = 10   (stale — row 10 is closed)
+Next save:     tries to close row 10 → wrong row
+```
+
+### The solution
+
+Include `trackingId` in the payload for `Changed` items. The backend returns `{ trackingId, value }` for every item that produced a new row — inserts and temporal updates alike. `onCommit(keys)` writes the new PK to the `@AutoId` field of every matched object.
+
+```
+Before save:   obj.trackingId = 3, obj.id = 10
+Payload:       { trackingId: 3, id: 10, ...fields }
+Backend:       closes row 10, inserts row 99, echoes { trackingId: 3, value: 99 }
+onCommit:      writes 99 to obj.id
+After save:    obj.id = 99   (correct, open row), state = Unchanged
+```
+
+### Full example
+
+```typescript
+import { Tracker, TrackedObject, TrackedCollection, State, Tracked, AutoId } from '@katn30/trakr';
+
+class RuleModel extends TrackedObject {
+  @AutoId
+  id: number = 0;
+
+  @Tracked()
+  accessor value: string = '';
+
+  constructor(tracker: Tracker) {
+    super(tracker);
+  }
+}
+
+const tracker = new Tracker();
+
+// Load existing rows from the server
+const rule = tracker.construct(() => new RuleModel(tracker));
+tracker.withTrackingSuppressed(() => { rule.id = 10; });
+// rule.state       === Unchanged
+// rule.trackingId  === 1   (assigned at construction)
+// rule.id          === 10  (real server PK)
+
+// User edits a value
+rule.value = '24h';
+// rule.state === Changed
+
+// --- Save ---
+
+const payload = {
+  inserts: [] as { trackingId: number; value: string }[],
+  changes: [] as { trackingId: number; id: number; value: string }[],
+  deletes: [] as { id: number }[],
+};
+
+for (const obj of tracker.trackedObjects) {
+  if (!(obj instanceof RuleModel)) continue;
+  switch (obj.state) {
+    case State.Insert:
+      payload.inserts.push({ trackingId: obj.trackingId, value: obj.value });
+      break;
+    case State.Changed:
+      // Send both trackingId (to correlate the response) and id (to close the right row)
+      payload.changes.push({ trackingId: obj.trackingId, id: obj.id, value: obj.value });
+      break;
+    case State.Deleted:
+      payload.deletes.push({ id: obj.id });
+      break;
+  }
+}
+
+// Backend closes row 10, inserts row 99, returns the mapping
+const response = await api.save(payload);
+// response.ids: [{ trackingId: 1, value: 99 }]  ← returned for both inserts and temporal changes
+
+// onCommit writes 99 to rule.id, transitions state to Unchanged
+tracker.onCommit(response.ids);
+// rule.id     === 99   (new open row)
+// rule.state  === Unchanged
+// tracker.isDirty === false
+```
+
+### Undo after a temporal commit
+
+If the user undoes past a committed temporal update, the object transitions back to `Changed` with the old field values restored by the property undo closures. On the next save, `obj.id` now holds `99` (the last committed PK), which is correct — the backend can use it to close row 99 and open a new one.
+
+```
+onCommit:      rule.id = 99, state = Unchanged
+tracker.undo() rule.value restored to previous value, state = Changed
+Next save:     payload.changes includes { trackingId: 1, id: 99, value: '...' }
+Backend:       closes row 99, inserts row 100, returns { trackingId: 1, value: 100 }
+onCommit:      rule.id = 100
+```
+
+### Deleted items
+
+For `Deleted` items the PK never changes — the backend just closes the existing row. No `trackingId` is needed in the delete payload; `obj.id` is always the correct row to close.
 
 ---
 

@@ -25,7 +25,7 @@ export abstract class TrackedObject implements ITracked, StateTarget {
   private _isValid: boolean = true;
   private _state: State = State.Unchanged;
 
-  public idPlaceholder: number | null = null;
+  public readonly trackingId: number;
 
   public readonly changed: TypedEvent<TrackedPropertyChanged> = new TypedEvent<TrackedPropertyChanged>();
   public readonly trackedChanged: TypedEvent<TrackedPropertyChanged> = new TypedEvent<TrackedPropertyChanged>();
@@ -87,6 +87,7 @@ export abstract class TrackedObject implements ITracked, StateTarget {
     if (process.env.NODE_ENV !== 'production' && !tracker._isConstructing) {
       throw new Error(`${this.constructor.name} must be created inside tracker.construct()`);
     }
+    this.trackingId = tracker._nextTrackingId();
     this.validationMessages = new Map<string, string>();
     tracker._trackObject(this);
   }

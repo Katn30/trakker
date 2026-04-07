@@ -24,7 +24,7 @@ export class Tracker {
   private _currentOperationPropertyName: string | undefined;
   private _isValid: boolean;
   private _canCommit: boolean;
-  private _placeholderCounter = -1;
+  private _trackingIdCounter = 1;
   private _invalidCount = 0;
   private _constructionDepth = 0;
   private _composingBaseIndex: number | undefined;
@@ -301,8 +301,8 @@ export class Tracker {
   }
 
   /** @internal */
-  public _nextPlaceholder(): number {
-    return this._placeholderCounter--;
+  public _nextTrackingId(): number {
+    return this._trackingIdCounter++;
   }
 
   public onCommit(keys?: IdAssignment[]): void {
