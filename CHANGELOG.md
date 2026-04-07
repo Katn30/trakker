@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.1.0] — 2026-04-07
+
+### New: `ITrackerContext` — shared interface for `Tracker` and `TrackerSession`
+
+Both `Tracker` and `TrackerSession` now implement `ITrackerContext`, making it possible to bind a single toolbar or UI component to either one without knowing the concrete type.
+
+```typescript
+import { ITrackerContext } from 'trakr';
+
+function bindToolbar(ctx: ITrackerContext) {
+  // undo/redo buttons, save button, debug panel — all driven by ITrackerContext
+}
+
+bindToolbar(tracker);         // global scope
+bindToolbar(session);         // modal / edit-form scope
+```
+
+**Interface members:**
+
+| Member | Type | Description |
+|---|---|---|
+| `isDirty` | `boolean` | `true` when there are uncommitted changes in scope |
+| `isValid` | `boolean` | `true` when all scoped properties pass validation |
+| `canCommit` | `boolean` | `true` when `isDirty && isValid` |
+| `trackedObjects` | `TrackedObject[]` | Objects in scope |
+| `deletedObjects` | `TrackedObject[]` | Scoped objects in `Deleted` state |
+
+**`TrackerSession` changes:**
+
+- `isDirty` now returns `boolean` instead of `boolean | undefined`. Defaults to `false` when no scope is provided (previously `undefined`).
+- `isValid` now returns `boolean` instead of `boolean | undefined`. Defaults to `true` when no scope is provided (previously `undefined`).
+- `canCommit`, `trackedObjects`, and `deletedObjects` added.
+
+---
+
 ## [2.0.0] — 2026-04-07
 
 ### Breaking changes

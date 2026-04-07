@@ -306,16 +306,16 @@ function openEditModal(model: PersonModel) {
     model,
     onConfirm: () => session.end(),
     onCancel:  () => session.rollback(),
-    canSave:   () => session.isDirty === true && session.isValid === true,
+    canSave:   () => session.canCommit,
   });
 }
 ```
 
-**`isDirty`** is `false` when the session starts (even if other objects are already dirty elsewhere), and becomes `true` the moment the user writes to any property listed in the scope.
+**`isDirty`** is `false` when the session starts (even if other objects are already dirty elsewhere), and becomes `true` the moment the user writes to any property listed in the scope. Defaults to `false` when no scope is provided.
 
-**`isValid`** checks `validationMessages` for every declared property. If any has a validation error — including one that existed *before* the session started — `isValid` is `false`, keeping the save button disabled until the user resolves it.
+**`isValid`** checks `validationMessages` for every declared property. If any has a validation error — including one that existed *before* the session started — `isValid` is `false`, keeping the save button disabled until the user resolves it. Defaults to `true` when no scope is provided.
 
-Both return `undefined` when `startSession()` is called without a scope argument.
+**`canCommit`** is `true` when `isDirty && isValid` — ready to enable a save button.
 
 **Multiple objects in scope**
 
@@ -617,6 +617,12 @@ const session = tracker.startSession();    // begin a session
 const session = tracker.startSession([…]); // same, with a property scope
 session.end();                             // commit — all changes become one undo step
 session.rollback();                        // revert — all changes since startSession
+
+session.isDirty;        // false until a scoped property is written
+session.isValid;        // false if any scoped property has a validation error
+session.canCommit;      // isDirty && isValid
+session.trackedObjects; // objects in scope ([] when no scope)
+session.deletedObjects; // scoped objects in Deleted state
 ```
 
 **Object construction**

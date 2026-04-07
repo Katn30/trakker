@@ -11,8 +11,9 @@ import { DependencyTracker, COLLECTION_VERSION_KEY } from "./DependencyTracker";
 import { ITracked } from "./ITracked";
 import { TrackedObject } from "./TrackedObject";
 import { TrackerSession, PropertyScope } from "./TrackerSession";
+import { ITrackerContext } from "./ITrackerContext";
 
-export class Tracker {
+export class Tracker implements ITrackerContext {
   private _currentOperation: Operation | undefined;
   private readonly _redoOperations: Operation[];
   private readonly _undoOperations: Operation[];
@@ -236,7 +237,7 @@ export class Tracker {
 
     if (this._currentSession !== undefined &&
         properties.property !== undefined &&
-        'validationMessages' in properties.trackedObject) {
+        properties.trackedObject instanceof TrackedObject) {
       this._currentSession._onWrite(properties.trackedObject, properties.property);
     }
 
