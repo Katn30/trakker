@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.2.0] — 2026-04-07
+
+### `ITrackerContext` extended — toolbar-ready interface
+
+`ITrackerContext` now covers the full set of members needed to drive an undo/redo toolbar, a save button, and a debug panel without knowing whether the backing context is a `Tracker` or a `TrackerSession`.
+
+**New members:**
+
+| Member | Type | Notes |
+|---|---|---|
+| `canUndo` | `boolean` | Delegates to `tracker.canUndo` on `TrackerSession` |
+| `canRedo` | `boolean` | Delegates to `tracker.canRedo` on `TrackerSession` |
+| `undo()` | `void` | Delegates to `tracker.undo()` on `TrackerSession` |
+| `redo()` | `void` | Delegates to `tracker.redo()` on `TrackerSession` |
+| `isDirtyChanged` | `TypedEvent<boolean>` | Re-exposes `tracker.isDirtyChanged` on `TrackerSession` |
+| `canCommitChanged` | `TypedEvent<boolean>` | Re-exposes `tracker.canCommitChanged` on `TrackerSession` |
+| `versionChanged` | `TypedEvent<number>` | Re-exposes `tracker.versionChanged` on `TrackerSession` |
+
+A toolbar component can now be written against `ITrackerContext` and accept either object interchangeably:
+
+```typescript
+function bindToolbar(ctx: ITrackerContext) {
+  undoButton.disabled  = !ctx.canUndo;
+  redoButton.disabled  = !ctx.canRedo;
+  saveButton.disabled  = !ctx.canCommit;
+  ctx.versionChanged.subscribe(() => refresh(ctx));
+}
+
+bindToolbar(tracker);  // global
+bindToolbar(session);  // scoped to an edit form
+```
+
+---
+
 ## [2.1.0] — 2026-04-07
 
 ### New: `ITrackerContext` — shared interface for `Tracker` and `TrackerSession`

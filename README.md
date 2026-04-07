@@ -621,8 +621,15 @@ session.rollback();                        // revert — all changes since start
 session.isDirty;        // false until a scoped property is written
 session.isValid;        // false if any scoped property has a validation error
 session.canCommit;      // isDirty && isValid
+session.canUndo;        // delegates to tracker
+session.canRedo;        // delegates to tracker
+session.undo();         // delegates to tracker
+session.redo();         // delegates to tracker
 session.trackedObjects; // objects in scope ([] when no scope)
 session.deletedObjects; // scoped objects in Deleted state
+session.isDirtyChanged;    // same event as tracker.isDirtyChanged
+session.canCommitChanged;  // same event as tracker.canCommitChanged
+session.versionChanged;    // same event as tracker.versionChanged
 ```
 
 **Object construction**

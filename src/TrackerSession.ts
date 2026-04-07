@@ -1,8 +1,19 @@
 import { TrackedObject } from "./TrackedObject";
 import { State } from "./State";
 import { ITrackerContext } from "./ITrackerContext";
+import { TypedEvent } from "./TypedEvent";
 
 export type PropertyScope = [TrackedObject, string[]];
+
+interface ITrackerDelegate {
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
+  undo(): void;
+  redo(): void;
+  readonly isDirtyChanged: TypedEvent<boolean>;
+  readonly canCommitChanged: TypedEvent<boolean>;
+  readonly versionChanged: TypedEvent<number>;
+}
 
 export class TrackerSession implements ITrackerContext {
   private readonly _scope: Map<TrackedObject, Set<string>> | undefined;
@@ -10,6 +21,7 @@ export class TrackerSession implements ITrackerContext {
 
   constructor(
     scope: PropertyScope[] | undefined,
+    private readonly _tracker: ITrackerDelegate,
     private readonly _end: () => void,
     private readonly _rollback: () => void,
   ) {
@@ -45,6 +57,14 @@ export class TrackerSession implements ITrackerContext {
     return this.isDirty && this.isValid;
   }
 
+  get canUndo(): boolean {
+    return this._tracker.canUndo;
+  }
+
+  get canRedo(): boolean {
+    return this._tracker.canRedo;
+  }
+
   get trackedObjects(): TrackedObject[] {
     if (this._scope === undefined) return [];
     return [...this._scope.keys()];
@@ -52,6 +72,26 @@ export class TrackerSession implements ITrackerContext {
 
   get deletedObjects(): TrackedObject[] {
     return this.trackedObjects.filter(obj => obj.state === State.Deleted);
+  }
+
+  undo(): void {
+    this._tracker.undo();
+  }
+
+  redo(): void {
+    this._tracker.redo();
+  }
+
+  get isDirtyChanged(): TypedEvent<boolean> {
+    return this._tracker.isDirtyChanged;
+  }
+
+  get canCommitChanged(): TypedEvent<boolean> {
+    return this._tracker.canCommitChanged;
+  }
+
+  get versionChanged(): TypedEvent<number> {
+    return this._tracker.versionChanged;
   }
 
   end(): void {

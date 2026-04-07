@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { TrackedObject } from "../src/TrackedObject";
 import { Tracker } from "../src/Tracker";
 import { Tracked } from "../src/Tracked";
 import { TrackedCollection } from "../src/TrackedCollection";
+import { State } from "../src/State";
 
 // ---- Models ----
 
@@ -396,5 +397,220 @@ describe("Tracker – session.rollback()", () => {
 
     expect(person.email).toBe("valid@example.com");
     expect(tracker.isValid).toBe(true);
+  });
+});
+
+// ---- ITrackerContext on TrackerSession ----
+
+describe("TrackerSession – ITrackerContext: scoped isDirty / isValid / canCommit", () => {
+  it("isDirty is false initially with a scope", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    expect(session.isDirty).toBe(false);
+  });
+
+  it("isDirty becomes true when a scoped property is written", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    person.firstName = "Alice";
+    expect(session.isDirty).toBe(true);
+  });
+
+  it("isDirty stays false when an out-of-scope property is written", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    person.lastName = "Smith";
+    expect(session.isDirty).toBe(false);
+  });
+
+  it("isDirty defaults to false when no scope is provided", () => {
+    const tracker = new Tracker();
+    const session = tracker.startSession();
+    expect(session.isDirty).toBe(false);
+  });
+
+  it("isValid is false when a scoped property has a validation error", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["email"]]]);
+    // email starts empty — validator fires during construct
+    expect(session.isValid).toBe(false);
+  });
+
+  it("isValid is true when all scoped properties pass validation", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => {
+      const p = new PersonModel(tracker);
+      p.email = "valid@example.com";
+      return p;
+    });
+    const session = tracker.startSession([[person, ["email"]]]);
+    expect(session.isValid).toBe(true);
+  });
+
+  it("isValid ignores validation errors on out-of-scope properties", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    // email is invalid but not in scope
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    expect(session.isValid).toBe(true);
+  });
+
+  it("isValid defaults to true when no scope is provided", () => {
+    const tracker = new Tracker();
+    const session = tracker.startSession();
+    expect(session.isValid).toBe(true);
+  });
+
+  it("canCommit is true when isDirty and isValid", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => {
+      const p = new PersonModel(tracker);
+      p.email = "valid@example.com";
+      return p;
+    });
+    const session = tracker.startSession([[person, ["firstName", "email"]]]);
+    person.firstName = "Alice";
+    expect(session.canCommit).toBe(true);
+  });
+
+  it("canCommit is false when not dirty", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => {
+      const p = new PersonModel(tracker);
+      p.email = "valid@example.com";
+      return p;
+    });
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    expect(session.canCommit).toBe(false);
+  });
+
+  it("canCommit is false when dirty but invalid", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["email"]]]);
+    person.email = "x";
+    person.email = "";  // back to invalid
+    expect(session.isDirty).toBe(true);
+    expect(session.isValid).toBe(false);
+    expect(session.canCommit).toBe(false);
+  });
+});
+
+describe("TrackerSession – ITrackerContext: trackedObjects / deletedObjects", () => {
+  it("trackedObjects returns the scoped objects", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    expect(session.trackedObjects).toEqual([person]);
+  });
+
+  it("trackedObjects returns empty array when no scope", () => {
+    const tracker = new Tracker();
+    const session = tracker.startSession();
+    expect(session.trackedObjects).toEqual([]);
+  });
+
+  it("deletedObjects returns scoped objects in Deleted state", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const people = new TrackedCollection<PersonModel>(tracker, [person]);
+    tracker.onCommit(); // person → Unchanged so removal marks it Deleted
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    people.remove(person);
+    expect(person.state).toBe(State.Deleted);
+    expect(session.deletedObjects).toEqual([person]);
+  });
+
+  it("deletedObjects is empty when no scoped object is deleted", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession([[person, ["firstName"]]]);
+    expect(session.deletedObjects).toEqual([]);
+  });
+});
+
+describe("TrackerSession – ITrackerContext: canUndo / canRedo / undo() / redo()", () => {
+  it("canUndo delegates to tracker", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession();
+    expect(session.canUndo).toBe(false);
+    person.firstName = "Alice";
+    session.end();
+    expect(session.canUndo).toBe(true);
+  });
+
+  it("canRedo delegates to tracker", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    person.firstName = "Alice";
+    expect(tracker.canRedo).toBe(false);
+    tracker.undo();
+    const session = tracker.startSession();
+    expect(session.canRedo).toBe(true);
+  });
+
+  it("undo() delegates to tracker", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    person.firstName = "Alice";
+    const session = tracker.startSession();
+    session.undo();
+    expect(person.firstName).toBe("");
+    session.end();
+  });
+
+  it("redo() delegates to tracker", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    person.firstName = "Alice";
+    tracker.undo();
+    const session = tracker.startSession();
+    session.redo();
+    expect(person.firstName).toBe("Alice");
+    session.end();
+  });
+});
+
+describe("TrackerSession – ITrackerContext: events delegate to tracker", () => {
+  it("isDirtyChanged fires when tracker dirty state changes", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession();
+    const handler = vi.fn();
+    session.isDirtyChanged.subscribe(handler);
+    person.firstName = "Alice";
+    session.end();
+    expect(handler).toHaveBeenCalledWith(true);
+  });
+
+  it("canCommitChanged fires when tracker canCommit changes", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => {
+      const p = new PersonModel(tracker);
+      p.email = "valid@example.com";
+      return p;
+    });
+    const session = tracker.startSession();
+    const handler = vi.fn();
+    session.canCommitChanged.subscribe(handler);
+    person.firstName = "Alice";
+    session.end();
+    expect(handler).toHaveBeenCalledWith(true);
+  });
+
+  it("versionChanged fires on every tracked write", () => {
+    const tracker = new Tracker();
+    const person = tracker.construct(() => new PersonModel(tracker));
+    const session = tracker.startSession();
+    const handler = vi.fn();
+    session.versionChanged.subscribe(handler);
+    person.firstName = "Alice";
+    expect(handler).toHaveBeenCalledTimes(1);
+    session.end();
   });
 });

@@ -341,6 +341,7 @@ export class Tracker implements ITrackerContext {
     this._composingRedoLength = this._redoOperations.length;
     this._currentSession = new TrackerSession(
       scope,
+      this,
       () => this.endComposing(),
       () => this.rollbackComposing(),
     );
